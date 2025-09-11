@@ -1,5 +1,8 @@
 # etl/bronze_extract.py
 from datetime import datetime
+from etl.config import Config
+from google.cloud import storage
+from io import BytesIO
 
 from pathlib import Path
 import gzip, json, hashlib
@@ -18,6 +21,18 @@ def _flush_chunk(out_dir: Path, chunk_idx: int, chunk_reviews: list) -> None:
         # On écrit un TABLEAU JSON (compatible avec ton parsing actuel)
         json.dump(chunk_reviews, gf, ensure_ascii=False)
     print(f"[INFO] Wrote {len(chunk_reviews)} reviews to {out_path.name}")
+
+def _flush_chunk_cloud(app_id: str, dt: str, chunk_idx: int, chunk_reviews: list) -> None:
+    client = storage.Client(project=Config.gcp_project)
+    bucket = client.bucket(Config.gcs_bucket)
+    blob = bucket.blob(f"raw/{app_id}/{dt}/reviews_chunk_{chunk_idx:04d}.json.gz")
+
+    buf = BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as gf:
+        gf.write(json.dumps(chunk_reviews, ensure_ascii=False).encode("utf-8"))
+    blob.upload_from_string(buf.getvalue(), content_type="application/gzip")
+    print(f"[INFO] GCS wrote {len(chunk_reviews)} reviews to {blob.name}")
+
 
 def extract_app(app_id: str, mode: str = "incr", for_airflow: bool = False,
                 max_pages: int = 200, chunk_size: int = 500) -> str:
@@ -103,10 +118,15 @@ def extract_app(app_id: str, mode: str = "incr", for_airflow: bool = False,
             if tsu > max_page_updated: max_page_updated = tsu
 
         # Si on a atteint chunk_size → on écrit un fichier
-        if len(chunk) >= chunk_size:
+    if len(chunk) >= chunk_size:
+        if Config.bronze_mode == "gcs":
+            _flush_chunk_cloud(app_id, dt, chunk_idx, chunk)
+        else:
             _flush_chunk(out_dir, chunk_idx, chunk)
-            chunk = []
-            chunk_idx += 1
+        chunk = []
+        chunk_idx += 1
+    
+
 
         # Avance le curseur
         last_cursor = new_cursor

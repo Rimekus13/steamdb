@@ -2,30 +2,47 @@
 import pandas as pd
 from typing import List, Dict, Any
 
-from .mongo_utils import bulk_upsert_clean, col_raw
 from .text_utils import clean_text, detect_lang, sentiment_scores
 from .config import Config
+
+from .firestore_utils import bulk_upsert_clean
+from google.cloud import storage
+from io import BytesIO
+import gzip, json
 
 
 def _read_raw_all(app_id: str, dt: str) -> pd.DataFrame:
     """
     Source Bronze :
-    - Si BRONZE_MODE='mongo' : on lit dans la collection unique reviews_raw (filtrée par app_id)
-    - Sinon : on lit les fichiers RAW (json.gz) sous data/raw/{app_id}/{YYYY-MM-DD}/*.json.gz
+    - Si BRONZE_MODE='gcs' : gs://<bucket>/raw/{app_id}/{YYYY-MM-DD}/*.json.gz
+    - Sinon : data/raw/{app_id}/{YYYY-MM-DD}/*.json.gz (local)
     """
-    if Config.bronze_mode == "mongo":
-        cur = col_raw().find({"app_id": str(app_id)}, {"_id": 0})
-        return pd.DataFrame(list(cur))
+    if Config.bronze_mode == "gcs":
+        client = storage.Client(project=Config.gcp_project)
+        bucket = client.bucket(Config.gcs_bucket)
+        prefix = f"raw/{app_id}/{dt}/"
+        records: List[Dict[str, Any]] = []
+        for blob in bucket.list_blobs(prefix=prefix):
+            if not blob.name.endswith(".json.gz"):
+                continue
+            data = blob.download_as_bytes()
+            try:
+                with gzip.GzipFile(fileobj=BytesIO(data), mode="rb") as gf:
+                    chunk = json.loads(gf.read().decode("utf-8"))
+                    if isinstance(chunk, list):
+                        records.extend(chunk)
+            except Exception as e:
+                print(f"[WARN] Failed {blob.name}: {e}")
+        return pd.DataFrame(records)
 
-    # --- Mode fichiers historique ---
-    import glob, gzip, json
+    # --- Mode fichiers (local dev) ---
+    import glob
     from pathlib import Path
     base = Path(f"data/raw/{app_id}/{dt}")
     if not base.exists():
         return pd.DataFrame()
-
     records: List[Dict[str, Any]] = []
-    for fp in sorted(glob.glob(str(base / "*.json.gz"))):
+    for fp in sorted(glob.glob(str(base / '*.json.gz'))):
         try:
             with gzip.open(fp, "rt", encoding="utf-8") as f:
                 chunk = json.load(f)
