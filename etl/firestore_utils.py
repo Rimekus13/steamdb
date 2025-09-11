@@ -1,60 +1,69 @@
 # etl/firestore_utils.py
-from typing import Iterable, List, Dict, Optional, Any
+from typing import Iterable, Dict, List, Optional
 from google.cloud import firestore
-import os
 
-def _client() -> firestore.Client:
-    project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("GCP_PROJECT")
-    return firestore.Client(project=project)
+def get_fs():
+    # Si la VM a un SA attaché, le projet est résolu automatiquement
+    return firestore.Client()
 
-COL_REVIEWS_CLEAN = "reviews_clean"
-COL_CO_COUNTS     = "cooccurrences_counts"
-COL_CO_PERCENT    = "cooccurrences_percent"
-
-def ensure_indexes(app_id: Optional[str] = None) -> None:
-    # Firestore: indexes composites à déclarer dans la console si besoin
-    return
-
-def bulk_upsert_clean(rows: List[Dict], *_args, **_kwargs) -> None:
+# ---------- SILVER ----------
+def bulk_upsert_clean(rows: List[Dict]) -> None:
+    """
+    Upsert des documents dans la collection reviews_clean.
+    Clé logique: (app_id + review_id) → doc_id = f"{app_id}__{review_id}"
+    """
     if not rows:
         return
-    db = _client()
-    batch = db.batch()
-    col = db.collection(COL_REVIEWS_CLEAN)
+    fs = get_fs()
+    batch = fs.batch()
+    col = fs.collection("reviews_clean")
+    i = 0
     for r in rows:
-        app_id = str(r.get("app_id"))
-        review_id = str(r.get("review_id"))
-        ref = col.document(f"{app_id}:{review_id}")
-        batch.set(ref, r, merge=True)
+        app_id = str(r.get("app_id", ""))
+        review_id = str(r.get("review_id", ""))
+        if not app_id or not review_id:
+            continue
+        doc_id = f"{app_id}__{review_id}"
+        batch.set(col.document(doc_id), r, merge=True)
+        i += 1
+        if i % 400 == 0:  # Firestore batch max 500 ops; 400 pour marge
+            batch.commit()
+            batch = fs.batch()
     batch.commit()
 
-def col_clean_query(_fields: Optional[Dict[str, Any]] = None) -> List[Dict]:
-    db = _client()
-    return [d.to_dict() or {} for d in db.collection(COL_REVIEWS_CLEAN).stream()]
+def col_clean_query() -> List[Dict]:
+    fs = get_fs()
+    docs = fs.collection("reviews_clean").stream()
+    return [d.to_dict() for d in docs]
 
-def replace_collection(name: str, docs: Iterable[Dict], *_args, **_kwargs) -> None:
-    db = _client()
-    col = db.collection(name)
-
-    # purge (par batch de 500)
-    to_del = list(col.limit(500).stream())
-    while to_del:
-        batch = db.batch()
-        for d in to_del:
-            batch.delete(d.reference)
+# ---------- GOLD ----------
+def replace_collection(name: str, docs: Iterable[Dict]) -> None:
+    """
+    Remplace complètement une collection Firestore (simple: purge + réinsert).
+    À utiliser pour cooccurrences_counts / cooccurrences_percent.
+    """
+    fs = get_fs()
+    col_ref = fs.collection(name)
+    # Purge (attention : Firestore n'a pas de truncate; on efface en batch)
+    # Ici on fait simple : on liste et on delete (OK pour tailles raisonnables)
+    to_del = list(col_ref.stream())
+    for i in range(0, len(to_del), 400):
+        batch = fs.batch()
+        for doc in to_del[i:i+400]:
+            batch.delete(doc.reference)
         batch.commit()
-        to_del = list(col.limit(500).stream())
 
+    # Insert en batch
     docs = list(docs)
     if not docs:
         return
-
-    batch = db.batch()
-    for i, r in enumerate(docs):
-        doc_id = f"{r.get('app_id','')}:{r.get('period','')}:{r.get('token_a','')}:{r.get('token_b','')}:{r.get('window','')}".strip(":")
-        ref = col.document(doc_id) if doc_id else col.document()
-        batch.set(ref, r)
-        if (i + 1) % 400 == 0:
+    i = 0
+    batch = fs.batch()
+    for d in docs:
+        doc_ref = col_ref.document()  # id auto
+        batch.set(doc_ref, d)
+        i += 1
+        if i % 400 == 0:
             batch.commit()
-            batch = db.batch()
+            batch = fs.batch()
     batch.commit()

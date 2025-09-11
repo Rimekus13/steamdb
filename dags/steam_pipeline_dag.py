@@ -1,3 +1,4 @@
+# dags/steam_pipeline_dag.py
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
@@ -24,20 +25,20 @@ with DAG(
     tags=["steam","etl","gcp"],
 ) as dag:
 
-    def task_extract():
+    def extract():
         for app_id in Config.app_ids:
-            extract_app(app_id, mode="incr", for_airflow=True)
+            extract_app(app_id, mode="incr")
 
-    def task_silver():
+    def silver():
         dt = datetime.utcnow().strftime("%Y-%m-%d")
         for app_id in Config.app_ids:
-            to_silver(app_id, dt=dt, for_airflow=True)
+            to_silver(app_id, dt=dt)
 
-    def task_gold():
-        build_gold(for_airflow=True)
+    def gold():
+        build_gold()  # traite tous les app_id présents en SILVER
 
-    t_extract = PythonOperator(task_id="extract_raw", python_callable=task_extract)
-    t_silver  = PythonOperator(task_id="build_silver", python_callable=task_silver)
-    t_gold    = PythonOperator(task_id="build_gold", python_callable=task_gold)
+    t_extract = PythonOperator(task_id="extract_raw", python_callable=extract)
+    t_silver  = PythonOperator(task_id="build_silver", python_callable=silver)
+    t_gold    = PythonOperator(task_id="build_gold", python_callable=gold)
 
     t_extract >> t_silver >> t_gold

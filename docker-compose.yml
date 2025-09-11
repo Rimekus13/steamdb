@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   airflow:
     image: apache/airflow:2.9.2
@@ -11,34 +9,27 @@ services:
       AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "True"
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "sqlite:////opt/airflow/airflow.db"
       AIRFLOW__CORE__EXECUTOR: "SequentialExecutor"
-      AIRFLOW__WEBSERVER__WEB_SERVER_HOST: "0.0.0.0"
       AIRFLOW__WEBSERVER__WEB_SERVER_PORT: "${AIRFLOW_PORT:-8081}"
-      PYTHONPATH: "/opt/airflow"
 
-      # === ETL ===
-      APPS_FILE: "/opt/airflow/apps.txt"
+      # Config ETL
       BRONZE_MODE: "gcs"
-      GCS_BUCKET: "${GCS_BUCKET:-steam-raw-data}"
-      GCP_PROJECT: "${GCP_PROJECT:-steam-etl-project}"
+      GCP_PROJECT: "${GCP_PROJECT}"
+      GCS_BUCKET: "${GCS_BUCKET}"
+      APPS_FILE: "/opt/airflow/apps.txt"
 
-      # === Auth GCP (Option A: clé JSON montée) ===
-      GOOGLE_APPLICATION_CREDENTIALS: "/opt/airflow/gcp-key.json"
+      PYTHONPATH: "/opt/airflow"
     ports:
       - "${AIRFLOW_PORT:-8081}:${AIRFLOW_PORT:-8081}"
     volumes:
       - ./dags:/opt/airflow/dags
       - ./etl:/opt/airflow/etl
-      - ./requirements.txt:/opt/airflow/requirements.txt:ro
       - ./apps.txt:/opt/airflow/apps.txt:ro
-      - ./data:/opt/airflow/data
-      - ./.state:/opt/airflow/.state
-      - ./gcp-key.json:/opt/airflow/gcp-key.json:ro  # supprime si tu relies la VM à un SA (Option B)
+      - ./requirements.txt:/opt/airflow/requirements.txt:ro
     command: >
       bash -lc '
-        set -e;
-        pip install -r /opt/airflow/requirements.txt || true;
+        set -e
+        pip install -r /opt/airflow/requirements.txt;
         airflow db init;
-        (airflow users create --username ${AIRFLOW_USER:-admin} --password ${AIRFLOW_PWD:-admin} \
-          --firstname Admin --lastname User --role Admin --email admin@example.com) || true;
+        (airflow users create --username ${AIRFLOW_USER:-admin} --password ${AIRFLOW_PWD:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com) || true;
         airflow scheduler & exec airflow webserver
       '
