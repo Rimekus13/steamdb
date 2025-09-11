@@ -1,4 +1,4 @@
-name: Deploy to GCP VM
+name: Deploy to GCE VM
 
 on:
   push:
@@ -10,32 +10,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout (optional)
+      - name: Checkout (juste pour avoir le SHA)
         uses: actions/checkout@v4
 
-      - name: Check required secrets
-        shell: bash
-        run: |
-          set -e
-          [ -n "${{ secrets.SSH_HOST }}" ] || { echo "❌ Missing secret SSH_HOST"; exit 1; }
-          [ -n "${{ secrets.SSH_USER }}" ] || { echo "❌ Missing secret SSH_USER"; exit 1; }
-          [ -n "${{ secrets.SSH_KEY }}" ] || { echo "❌ Missing secret SSH_KEY (base64)"; exit 1; }
-          echo "✅ All required secrets are present."
-
-      - name: Rebuild private key from base64
-        shell: bash
-        run: |
-          echo "${{ secrets.SSH_KEY }}" | base64 -d > gcp_ci
-          chmod 600 gcp_ci
-          # Sanity: refuse empty file
-          [ -s gcp_ci ] || { echo "❌ Decoded key is empty"; exit 1; }
-
-      - name: Deploy on VM via SSH
+      - name: Déployer sur la VM via SSH (appleboy)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          key_path: gcp_ci     # on passe par le fichier généré
+          key: ${{ secrets.SSH_KEY_PEM }}     # <-- clé privée en clair
           port: 22
           script_stop: true
           script: |
@@ -43,26 +26,24 @@ jobs:
 
             APP_DIR="/home/${{ secrets.SSH_USER }}/steamdb"
 
-            # 1) Clone initial si nécessaire
+            # 1) Clone initial si besoin
             if [ ! -d "$APP_DIR/.git" ]; then
-              echo "Cloning repository..."
               git clone https://github.com/${{ github.repository }} "$APP_DIR"
             fi
 
-            # 2) Synchroniser la ref exacte construite par la CI
+            # 2) Checkout sur la même révision que la CI
             cd "$APP_DIR"
             git fetch --all --prune
-            git checkout "${{ github.ref_name }}" || git checkout -b "${{ github.ref_name }}"
+            git checkout main
             git reset --hard "${{ github.sha }}"
 
-            # 3) Redémarrer la stack Docker (Airflow, Mongo, etc.)
+            # 3) Redémarrer la stack Docker
             docker compose pull || true
             docker compose down || true
             docker compose up -d
 
-            # 4) Afficher l’état
+            # 4) Sanity check
             docker compose ps
 
-            # 5) (Optionnel) Lister les DAGs Airflow
+            # 5) (optionnel) lister les DAGs
             # docker compose exec -T airflow airflow dags list || true
-            echo "✅ Deployment completed."
