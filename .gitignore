@@ -1,0 +1,12 @@
+.env
+*.env
+.env.*
+__pycache__/
+.airflow/
+logs/
+data/logs/
+data/tmp/
+.ipynb_checkpoints/
+.pytest_cache/
+.DS_Store
+/data

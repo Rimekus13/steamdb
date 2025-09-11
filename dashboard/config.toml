@@ -1,0 +1,4 @@
+[server]
+mediaFileStorage = "filesystem"
+# (optionnel)
+# mediaFileStorageBaseDir = "D:/Projet/steam/.streamlit_media"
