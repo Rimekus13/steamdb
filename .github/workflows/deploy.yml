@@ -13,46 +13,55 @@ jobs:
       - name: Checkout (optional)
         uses: actions/checkout@v4
 
-      # Étape sanity-check : vérifie que les secrets existent (sinon on fail vite)
       - name: Check required secrets
         shell: bash
         run: |
           set -e
           [ -n "${{ secrets.SSH_HOST }}" ] || { echo "❌ Missing secret SSH_HOST"; exit 1; }
           [ -n "${{ secrets.SSH_USER }}" ] || { echo "❌ Missing secret SSH_USER"; exit 1; }
-          [ -n "${{ secrets.SSH_KEY_B64 }}" ] || { echo "❌ Missing secret SSH_KEY_B64"; exit 1; }
+          [ -n "${{ secrets.SSH_KEY }}" ] || { echo "❌ Missing secret SSH_KEY (base64)"; exit 1; }
           echo "✅ All required secrets are present."
 
-      # On reconstruit la clé privée depuis le base64 (évite les soucis de formatage)
-      - name: Prepare SSH key
+      - name: Rebuild private key from base64
         shell: bash
         run: |
-          echo "${{ secrets.SSH_KEY_B64 }}" | base64 -d > gcp_ci
+          echo "${{ secrets.SSH_KEY }}" | base64 -d > gcp_ci
           chmod 600 gcp_ci
+          # Sanity: refuse empty file
+          [ -s gcp_ci ] || { echo "❌ Decoded key is empty"; exit 1; }
 
-      # Connexion SSH et déploiement
-      - name: Deploy to VM (SSH)
+      - name: Deploy on VM via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          key_path: gcp_ci         # <- on passe par un fichier, pas 'key:'
+          key_path: gcp_ci     # on passe par le fichier généré
           port: 22
           script_stop: true
           script: |
             set -e
 
             APP_DIR="/home/${{ secrets.SSH_USER }}/steamdb"
+
+            # 1) Clone initial si nécessaire
             if [ ! -d "$APP_DIR/.git" ]; then
+              echo "Cloning repository..."
               git clone https://github.com/${{ github.repository }} "$APP_DIR"
             fi
 
+            # 2) Synchroniser la ref exacte construite par la CI
             cd "$APP_DIR"
             git fetch --all --prune
             git checkout "${{ github.ref_name }}" || git checkout -b "${{ github.ref_name }}"
             git reset --hard "${{ github.sha }}"
 
+            # 3) Redémarrer la stack Docker (Airflow, Mongo, etc.)
             docker compose pull || true
             docker compose down || true
             docker compose up -d
+
+            # 4) Afficher l’état
             docker compose ps
+
+            # 5) (Optionnel) Lister les DAGs Airflow
+            # docker compose exec -T airflow airflow dags list || true
