@@ -1,19 +1,25 @@
-# steam/etl/silver_clean.py
+# etl/silver_clean.py
 import pandas as pd
 from typing import List, Dict, Any
 
-from .mongo_utils import bulk_upsert_clean
+from .mongo_utils import bulk_upsert_clean, col_raw
 from .text_utils import clean_text, detect_lang, sentiment_scores
+from .config import Config
 
 
 def _read_raw_all(app_id: str, dt: str) -> pd.DataFrame:
     """
-    Charge tous les fichiers RAW (json.gz) du datalake pour un app_id/date.
-    Ex: data/raw/{app_id}/{YYYY-MM-DD}/*.json.gz
+    Source Bronze :
+    - Si BRONZE_MODE='mongo' : on lit dans la collection unique reviews_raw (filtrée par app_id)
+    - Sinon : on lit les fichiers RAW (json.gz) sous data/raw/{app_id}/{YYYY-MM-DD}/*.json.gz
     """
+    if Config.bronze_mode == "mongo":
+        cur = col_raw().find({"app_id": str(app_id)}, {"_id": 0})
+        return pd.DataFrame(list(cur))
+
+    # --- Mode fichiers historique ---
     import glob, gzip, json
     from pathlib import Path
-
     base = Path(f"data/raw/{app_id}/{dt}")
     if not base.exists():
         return pd.DataFrame()
@@ -32,16 +38,14 @@ def _read_raw_all(app_id: str, dt: str) -> pd.DataFrame:
 
 def _standardize_ids(df: pd.DataFrame, app_id: str) -> pd.DataFrame:
     """
-    Normalise les identifiants:
-    - app_id toujours présent
-    - review_id = recommendationid (Steam) si absent
+    Normalise les identifiants :
+    - app_id toujours présent (str)
+    - review_id = recommendationid (Steam) si absent (str)
     """
     if "app_id" not in df.columns:
         df["app_id"] = app_id
-    # crée review_id à partir de recommendationid si besoin
     if "review_id" not in df.columns and "recommendationid" in df.columns:
         df["review_id"] = df["recommendationid"]
-    # force en str (évite erreurs de types)
     for c in ("app_id", "review_id"):
         if c in df.columns:
             df[c] = df[c].astype(str)
@@ -78,7 +82,7 @@ def _prep_text_language_sentiment(df: pd.DataFrame) -> pd.DataFrame:
     if mask.any():
         df.loc[mask, "language"] = df.loc[mask, "cleaned_review"].map(detect_lang)
 
-    # sentiment
+    # sentiment (vader compound → classes)
     sents = df["cleaned_review"].map(sentiment_scores)
     df["compound"] = [s.get("compound", 0.0) for s in sents]
     df["sentiment"] = pd.cut(
@@ -90,7 +94,7 @@ def _prep_text_language_sentiment(df: pd.DataFrame) -> pd.DataFrame:
 
 def to_silver(app_id: str, dt: str, for_airflow: bool = False) -> str:
     """
-    Lit le RAW du datalake, prépare/normalise, et publie le CLEAN dans Mongo.
+    Prépare/normalise et publie le CLEAN dans Mongo (collection reviews_clean).
     """
     df = _read_raw_all(app_id, dt)
     if df.empty:
@@ -101,10 +105,10 @@ def to_silver(app_id: str, dt: str, for_airflow: bool = False) -> str:
     df = _prep_timestamps(df)
     df = _prep_text_language_sentiment(df)
 
-    # Champs conservés (adapter si besoin pour ton dashboard)
+    # Champs conservés (adapter selon ton dashboard)
     keep = [
-        "app_id", "review_id",              # <- IMPORTANT: review_id normalisé
-        "recommendationid",                 # on garde aussi la colonne d'origine si présente
+        "app_id", "review_id",              # <- IMPORTANT
+        "recommendationid",
         "author", "language",
         "voted_up", "votes_up", "votes_funny",
         "weighted_vote_score",
@@ -112,14 +116,11 @@ def to_silver(app_id: str, dt: str, for_airflow: bool = False) -> str:
         "timestamp_created", "timestamp_updated",
         "review_date",
     ]
-    # Ajoute les colonnes manquantes pour éviter KeyError à la sélection
     for col in keep:
         if col not in df.columns:
             df[col] = None
 
     rows = df[keep].to_dict("records")
-
-    # Publication en Mongo (collection CLEAN)
     bulk_upsert_clean(rows, for_airflow=for_airflow)
     print(f"[INFO] Silver upserted: {len(rows)} rows for app_id={app_id}")
     return dt

@@ -10,8 +10,9 @@ def get_client(for_airflow: bool = False) -> MongoClient:
 def get_db(for_airflow: bool = False):
     return get_client(for_airflow)[Config.mongo_db]
 
-def col_raw(app_id: str, for_airflow: bool = False):
-    return get_db(for_airflow)[f"reviews_{app_id}"]
+# --- Collections uniques ---
+def col_raw(for_airflow: bool = False):
+    return get_db(for_airflow)["reviews_raw"]
 
 def col_clean(for_airflow: bool = False):
     return get_db(for_airflow)["reviews_clean"]
@@ -22,69 +23,66 @@ def col_co_counts(for_airflow: bool = False):
 def col_co_percent(for_airflow: bool = False):
     return get_db(for_airflow)["cooccurrences_percent"]
 
-def ensure_indexes(app_id: str, for_airflow: bool = False):
-    """
-    Crée les index utiles sur RAW / SILVER / GOLD (idempotent).
-    NB: GOLD utilise désormais token_a/token_b + period + window (plus term/co_term).
-    """
-    # RAW (par app)
-    c = col_raw(app_id, for_airflow)
-    c.create_index([("recommendationid", ASCENDING)], name="uniq_reco", unique=True)
-    c.create_index([("timestamp_updated", ASCENDING)])
-    c.create_index([("author.steamid", ASCENDING)])
+def ensure_indexes(for_airflow: bool = False):
+    # RAW
+    r = col_raw(for_airflow)
+    r.create_index([("app_id", ASCENDING), ("recommendationid", ASCENDING)], name="uniq_app_reco", unique=True)
+    r.create_index([("app_id", ASCENDING), ("timestamp_updated", ASCENDING)], name="by_app_ts")
 
     # SILVER
     cl = col_clean(for_airflow)
-    cl.create_index([("app_id", ASCENDING), ("review_id", ASCENDING)], name="uniq_clean", unique=True)
-    cl.create_index([("app_id", ASCENDING), ("review_date", ASCENDING)], name="by_app_period")  # utile pour filtres temporels
+    cl.create_index([("app_id", ASCENDING), ("review_id", ASCENDING)], name="uniq_app_review", unique=True)
+    cl.create_index([("app_id", ASCENDING), ("review_date", ASCENDING)], name="by_app_date")
     cl.create_index([("language", ASCENDING)])
     cl.create_index([("sentiment", ASCENDING)])
 
     # GOLD — COUNTS
     cc = col_co_counts(for_airflow)
-    # Unicité d’une paire pour un jeu, une période et une fenêtre
     cc.create_index(
         [("app_id", ASCENDING), ("token_a", ASCENDING), ("token_b", ASCENDING), ("period", ASCENDING), ("window", ASCENDING)],
-        name="uniq_app_tokens_period_window",
-        unique=True
+        name="uniq_app_tokens_period_window", unique=True
     )
-    # Top par période
     cc.create_index([("app_id", ASCENDING), ("period", ASCENDING), ("count", DESCENDING)], name="top_by_period")
 
     # GOLD — PERCENTS
     cp = col_co_percent(for_airflow)
     cp.create_index(
         [("app_id", ASCENDING), ("token_a", ASCENDING), ("token_b", ASCENDING), ("period", ASCENDING), ("window", ASCENDING)],
-        name="uniq_app_tokens_period_window",
-        unique=True
+        name="uniq_app_tokens_period_window", unique=True
     )
     cp.create_index([("app_id", ASCENDING), ("period", ASCENDING), ("percent", DESCENDING)], name="top_by_period")
 
+def bulk_upsert_raw(app_id: str, reviews: List[Dict], for_airflow: bool = False):
+    if not reviews: return
+    ops = []
+    for r in reviews:
+        key = {"app_id": str(app_id), "recommendationid": str(r.get("recommendationid"))}
+        doc = dict(r)
+        doc["app_id"] = str(app_id)
+        ops.append(UpdateOne(key, {"$set": doc}, upsert=True))
+    try:
+        col_raw(for_airflow).bulk_write(ops, ordered=False)
+    except BulkWriteError:
+        pass
+
 def bulk_upsert_clean(rows: List[Dict], for_airflow: bool = False):
-    """
-    Upsert des documents dans reviews_clean par clé (app_id, review_id).
-    Idempotent et tolérant aux collisions (BulkWriteError).
-    """
-    if not rows:
-        return
+    if not rows: return
     ops = []
     for r in rows:
         key = {"app_id": str(r["app_id"]), "review_id": str(r["review_id"])}
         ops.append(UpdateOne(key, {"$set": r}, upsert=True))
-    try:
-        col_clean(for_airflow).bulk_write(ops, ordered=False)
-    except BulkWriteError:
-        # collisions bénignes si plusieurs workers traitent les mêmes IDs
-        pass
+    col_clean(for_airflow).bulk_write(ops, ordered=False)
 
-
-def replace_collection(name: str, docs: Iterable[Dict], for_airflow: bool = False):
+def replace_collection(name: str, docs: Iterable[Dict], for_airflow: bool = False, app_id: str | None = None):
     """
-    Remplace complètement une collection par un nouvel ensemble de documents.
-    Utilisé par le build Gold (counts/percent).
+    Pour GOLD: on remplace UNIQUEMENT les docs de l'app_id courant si fourni
+    (sinon on drop toute la collection — à éviter en multi-app).
     """
     c = get_db(for_airflow)[name]
-    c.drop()
     docs = list(docs)
-    if docs:
-        c.insert_many(docs, ordered=False)
+    if app_id is None:
+        c.drop()
+        if docs: c.insert_many(docs, ordered=False)
+    else:
+        c.delete_many({"app_id": str(app_id)})
+        if docs: c.insert_many(docs, ordered=False)
