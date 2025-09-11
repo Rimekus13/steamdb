@@ -2,29 +2,57 @@ name: Deploy to GCP VM
 
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
+  workflow_dispatch: {}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
 
-      - name: Deploy on GCP VM
+      # Étape sanity-check : vérifie que les secrets existent (sinon on fail vite)
+      - name: Check required secrets
+        shell: bash
+        run: |
+          set -e
+          [ -n "${{ secrets.SSH_HOST }}" ] || { echo "❌ Missing secret SSH_HOST"; exit 1; }
+          [ -n "${{ secrets.SSH_USER }}" ] || { echo "❌ Missing secret SSH_USER"; exit 1; }
+          [ -n "${{ secrets.SSH_KEY_B64 }}" ] || { echo "❌ Missing secret SSH_KEY_B64"; exit 1; }
+          echo "✅ All required secrets are present."
+
+      # On reconstruit la clé privée depuis le base64 (évite les soucis de formatage)
+      - name: Prepare SSH key
+        shell: bash
+        run: |
+          echo "${{ secrets.SSH_KEY_B64 }}" | base64 -d > gcp_ci
+          chmod 600 gcp_ci
+
+      # Connexion SSH et déploiement
+      - name: Deploy to VM (SSH)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
+          key_path: gcp_ci         # <- on passe par un fichier, pas 'key:'
           port: 22
+          script_stop: true
           script: |
             set -e
-            cd /home/${{ secrets.SSH_USER }}/steamdb || git clone https://github.com/Rimekus13/steamdb /home/${{ secrets.SSH_USER }}/steamdb
-            cd /home/${{ secrets.SSH_USER }}/steamdb
-            git fetch --all
-            git reset --hard origin/main
+
+            APP_DIR="/home/${{ secrets.SSH_USER }}/steamdb"
+            if [ ! -d "$APP_DIR/.git" ]; then
+              git clone https://github.com/${{ github.repository }} "$APP_DIR"
+            fi
+
+            cd "$APP_DIR"
+            git fetch --all --prune
+            git checkout "${{ github.ref_name }}" || git checkout -b "${{ github.ref_name }}"
+            git reset --hard "${{ github.sha }}"
+
+            docker compose pull || true
             docker compose down || true
-            docker compose up -d --build
+            docker compose up -d
+            docker compose ps
