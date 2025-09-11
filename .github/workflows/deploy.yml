@@ -1,0 +1,68 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [ "CI" ]          # <- doit matcher exactement le "name" du CI
+    types: [ completed ]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Deploy to VM via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.GCP_HOST }}
+          username: ${{ secrets.GCP_USER }}
+          key: ${{ secrets.GCP_SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script_stop: true
+          script: |
+            set -e
+
+            # Chemin d'app par défaut si non fourni
+            APP_DIR="${{ secrets.APP_DIR }}"
+            if [ -z "$APP_DIR" ]; then
+              APP_DIR="/home/${{ secrets.GCP_USER }}/steamdb"
+            fi
+
+            # 1) Clone initial si nécessaire
+            if [ ! -d "$APP_DIR/.git" ]; then
+              git clone https://github.com/${{ github.repository }} "$APP_DIR"
+            fi
+
+            # 2) Checkout du commit / branche à déployer
+            cd "$APP_DIR"
+            git fetch --all --prune
+            # si déclenché par CI, on déploie la même ref que la CI
+            REF="${{ github.event.workflow_run.head_sha || github.sha }}"
+            BRANCH="${{ github.event.workflow_run.head_branch || github.ref_name }}"
+            git checkout "$BRANCH" || git checkout -b "$BRANCH"
+            git reset --hard "$REF"
+
+            # 3) (optionnel) créer/mettre à jour .env à partir de secrets GitHub
+            #    -> décommente si tu veux pousser des secrets d'env dans la VM
+            # cat > .env <<'ENVV'
+            # APP_IDS_FILE=apps.txt
+            # BRONZE_MODE=gcs
+            # GCS_BUCKET=${{ secrets.GCS_BUCKET }}
+            # FIRESTORE_PROJECT=${{ secrets.GCP_PROJECT }}
+            # ENVV
+
+            # 4) Redémarrer la stack Docker (Airflow, etc.)
+            docker compose pull || true
+            docker compose down || true
+            docker compose up -d
+
+            # 5) Sanity check
+            docker compose ps
+
+            # 6) (optionnel) afficher les DAGs détectés
+            # docker compose exec -T airflow airflow dags list || true
