@@ -65,3 +65,4 @@ jobs:
 
             # 5) (Optionnel) Lister les DAGs Airflow
             # docker compose exec -T airflow airflow dags list || true
+            echo "✅ Deployment completed."
