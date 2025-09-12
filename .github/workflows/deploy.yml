@@ -8,72 +8,71 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: SSH Deploy
+      # Définis les variables à partir des secrets ICI
+      - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
-        env:                       # variables injectées depuis secrets
+        env:                                  # <- côté GitHub
           APP_DIR: /steamdb
           GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
           GCS_BUCKET:  ${{ secrets.GCS_BUCKET }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
+          key: ${{ secrets.SSH_KEY }}         # clé privée CI/CD (multiligne)
           port: 22
-          envs: APP_DIR,GCP_PROJECT,GCS_BUCKET   # exportées vers la session SSH
+          envs: APP_DIR,GCP_PROJECT,GCS_BUCKET  # <- export vers la VM
           script_stop: true
           script: |
-            set -eu
-            echo "[INFO] Vars on remote:"
+            #!/bin/sh
+            # Pas de "set -e" pour ne pas casser les tests de variables
+
+            echo "[INFO] Variables reçues sur la VM:"
             echo "  APP_DIR=${APP_DIR-<empty>}"
             echo "  GCP_PROJECT=${GCP_PROJECT-<empty>}"
             echo "  GCS_BUCKET=${GCS_BUCKET-<empty>}"
 
-            # Définir les valeurs (avec fallback si besoin)
-            APP_DIR="${APP_DIR:-/steamdb}"
-            GCP_PROJECT="${GCP_PROJECT:-}"
-            GCS_BUCKET="${GCS_BUCKET:-}"
-            FIRESTORE_PROJECT="${FIRESTORE_PROJECT:-$GCP_PROJECT}"
-
-            [ -n "$GCP_PROJECT" ] || { echo "[ERROR] GCP_PROJECT manquant"; exit 1; }
-            [ -n "$GCS_BUCKET" ]  || { echo "[ERROR] GCS_BUCKET manquant";  exit 1; }
+            # Fallbacks + contrôles *robustes* (POSIX)
+            [ -n "${APP_DIR:-}" ] || APP_DIR="/steamdb"
+            if [ -z "${GCP_PROJECT:-}" ]; then echo "[ERROR] GCP_PROJECT manquant"; exit 1; fi
+            if [ -z "${GCS_BUCKET:-}" ];  then echo "[ERROR] GCS_BUCKET manquant";  exit 1; fi
 
             mkdir -p "$APP_DIR"
-            cd "$APP_DIR"
+            cd "$APP_DIR" || { echo "[ERROR] APP_DIR introuvable"; exit 1; }
 
-            # Génération du fichier .env
-            {
-              echo "GCP_PROJECT=$GCP_PROJECT"
-              echo "GCS_BUCKET=$GCS_BUCKET"
-              echo "FIRESTORE_PROJECT=$FIRESTORE_PROJECT"
-              echo "AIRFLOW_PORT=8081"
-              echo "STREAMLIT_PORT=8501"
-            } > .env
-            echo "[INFO] .env:"; cat .env
+            # Écrire .env
+            cat > .env <<EOF
+            GCP_PROJECT=${GCP_PROJECT}
+            GCS_BUCKET=${GCS_BUCKET}
+            FIRESTORE_PROJECT=${FIRESTORE_PROJECT:-${GCP_PROJECT}}
+            AIRFLOW_PORT=8081
+            STREAMLIT_PORT=8501
+            EOF
 
-            # Vérifier Docker Compose
+            echo "[INFO] .env écrit :"
+            cat .env
+
+            # Docker Compose présent ?
             if docker compose version >/dev/null 2>&1; then
               DC="docker compose"
             elif command -v docker-compose >/dev/null 2>&1; then
               DC="docker-compose"
             else
-              echo "[INFO] Installing docker compose plugin..."
+              echo "[INFO] Installation docker compose plugin…"
               sudo apt-get update -y
               sudo apt-get install -y docker-compose-plugin
               DC="docker compose"
             fi
 
-            # Déploiement
             $DC pull || true
             $DC down || true
             $DC up -d
             $DC ps
 
-            # Airflow: unpause + trigger DAG
+            # Airflow: unpause + trigger (ignorer si le service n'existe pas)
             sleep 10
             $DC exec -T airflow airflow dags unpause steam_etl_gcp || true
             $DC exec -T airflow airflow dags trigger steam_etl_gcp || true
