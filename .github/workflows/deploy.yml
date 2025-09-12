@@ -10,7 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       APP_DIR: /home/steamdb_ynov/steamdb
-      # on met les secrets dans l'env du job pour pouvoir les passer à distance
       GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
       GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
       FIRESTORE_PROJECT: ${{ secrets.FIRESTORE_PROJECT }}
@@ -20,7 +19,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) Nettoyage dossier cible + droits (évite .git "Permission denied")
       - name: Prepare target folder (own & clean)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -29,23 +27,17 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: 22
           script_stop: true
-          # on passe les env au remote pour pouvoir les réutiliser si besoin
           envs: APP_DIR
           script: |
-            bash -lc '
-              set -Eeuo pipefail
-              APP_DIR="${APP_DIR:-$HOME/steamdb}"
-              echo "[INFO] Preparing ${APP_DIR} on $(hostname) as $(whoami)"
-              sudo mkdir -p "$APP_DIR"
-              sudo chown -R "$(whoami):$(whoami)" "$APP_DIR"
-              rm -rf "$APP_DIR/.git"
-              # si tu n’as pas de dossier data à garder, tu peux remplacer par: rm -rf "$APP_DIR"/*
-              find "$APP_DIR" -mindepth 1 -maxdepth 1 -not -name "data" -exec rm -rf {} +
-              mkdir -p "$APP_DIR"
-              ls -la "$APP_DIR"
-            '
+            set -euo pipefail
+            APP_DIR="${APP_DIR:-$HOME/steamdb}"
+            echo "[INFO] Preparing ${APP_DIR} on $(hostname) as $(whoami)"
+            sudo mkdir -p "$APP_DIR"
+            sudo chown -R "$(whoami):$(whoami)" "$APP_DIR"
+            rm -rf "$APP_DIR/.git"
+            find "$APP_DIR" -mindepth 1 -maxdepth 1 -not -name "data" -exec rm -rf {} +
+            mkdir -p "$APP_DIR"
 
-      # 2) Upload SANS .git (whitelist des chemins utiles)
       - name: Upload project to VM (no .git)
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -55,7 +47,6 @@ jobs:
           port: 22
           target: "${{ env.APP_DIR }}"
           overwrite: true
-          # ⚠️ Si un de ces chemins n’existe pas dans ton repo, ENLÈVE-LE, sinon scp-action échoue.
           source: |
             docker-compose.yml
             requirements.txt
@@ -64,7 +55,6 @@ jobs:
             etl
             streamlit
 
-      # 3) Déployer: écrire .env, déposer la clé (si fournie), installer Docker/Compose, up, trigger Airflow
       - name: Deploy and trigger
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -74,61 +64,68 @@ jobs:
           port: 22
           script_stop: true
           command_timeout: 60m
-          # on transmet les variables au shell distant proprement
           envs: APP_DIR,GCP_PROJECT,GCS_BUCKET,FIRESTORE_PROJECT,GCP_SA_KEY
           script: |
-            bash -lc '
-              set -Eeuo pipefail
-              APP_DIR="${APP_DIR:-$HOME/steamdb}"
-              cd "$APP_DIR"
+            set -euo pipefail
+            APP_DIR="${APP_DIR:-$HOME/steamdb}"
+            cd "$APP_DIR"
 
-              # .env pour docker compose (fallback Firestore -> GCP_PROJECT côté shell)
-              : "${FIRESTORE_PROJECT:=${GCP_PROJECT}}"
-              cat > .env <<EOF
+            # Fallback Firestore -> GCP_PROJECT si non fourni
+            if [ -z "${FIRESTORE_PROJECT:-}" ]; then
+              FIRESTORE_PROJECT="$GCP_PROJECT"
+            fi
+
+            # Ecrire .env pour docker compose
+            cat > .env <<EOF
 GCP_PROJECT=${GCP_PROJECT}
 GCS_BUCKET=${GCS_BUCKET}
 FIRESTORE_PROJECT=${FIRESTORE_PROJECT}
 AIRFLOW_PORT=8081
 STREAMLIT_PORT=8501
 EOF
-              echo "[INFO] .env written:"; cat .env
+            echo "[INFO] .env written"
+            cat .env
 
-              # clé de service (optionnelle)
-              if [ -n "${GCP_SA_KEY}" ]; then
-                echo "${GCP_SA_KEY}" > gcp-sa.json
-                chmod 600 gcp-sa.json
-                echo "[INFO] gcp-sa.json created"
-              fi
+            # Déposer la clé de service (optionnelle)
+            if [ -n "${GCP_SA_KEY:-}" ]; then
+              echo "${GCP_SA_KEY}" > gcp-sa.json
+              chmod 600 gcp-sa.json
+              echo "[INFO] gcp-sa.json created"
+            fi
 
-              # Docker
-              if ! command -v docker >/dev/null 2>&1; then
-                sudo apt-get update -y
-                sudo apt-get install -y docker.io
-                sudo systemctl enable docker
-                sudo systemctl start docker
-                sudo usermod -aG docker "$(whoami)" || true
-              fi
+            # Installer Docker si absent
+            if ! command -v docker >/dev/null 2>&1; then
+              sudo apt-get update -y
+              sudo apt-get install -y docker.io
+              sudo systemctl enable docker
+              sudo systemctl start docker
+              sudo usermod -aG docker "$(whoami)" || true
+            fi
 
-              # Compose (v2 standalone si plugin absent)
-              if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
-                COMPOSE_VERSION="v2.28.1"
-                sudo curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
-                  -o /usr/local/bin/docker-compose
-                sudo chmod +x /usr/local/bin/docker-compose
-              fi
-              if docker compose version >/dev/null 2>&1; then DC="docker compose"; else DC="docker-compose"; fi
+            # Installer docker-compose v2 standalone si besoin
+            if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
+              COMPOSE_VERSION="v2.28.1"
+              sudo curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
+              sudo chmod +x /usr/local/bin/docker-compose
+            fi
 
-              # (Re)lancer
-              $DC pull || true
-              $DC down || true
-              $DC up -d
-              $DC ps
+            # Choisir la bonne commande compose
+            if docker compose version >/dev/null 2>&1; then
+              DC="docker compose"
+            else
+              DC="docker-compose"
+            fi
 
-              # Trigger du DAG (laisse 10s au webserver/scheduler)
-              sleep 10
-              $DC exec -T airflow airflow dags unpause steam_etl_gcp || true
-              $DC exec -T airflow airflow dags trigger steam_etl_gcp || true
+            # (Re)lancer
+            $DC pull || true
+            $DC down || true
+            $DC up -d
+            $DC ps
 
-              echo "[INFO] Tail airflow logs (last 200 lines):"
-              $DC logs --tail=200 airflow || true
-            '
+            # Trigger Airflow
+            sleep 10
+            $DC exec -T airflow airflow dags unpause steam_etl_gcp || true
+            $DC exec -T airflow airflow dags trigger steam_etl_gcp || true
+
+            echo "[INFO] Tail airflow logs (last 100 lines)"
+            $DC logs --tail=100 airflow || true
