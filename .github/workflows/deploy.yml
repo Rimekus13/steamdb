@@ -9,23 +9,44 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      APP_DIR: /home/steamdb_ynov/steamdb   # dossier cible sur ta VM
+      APP_DIR: /home/steamdb_ynov/steamdb
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Upload repo to VM
+      # 1) PREP: clean dossier cible + droits (supprime ancien .git)
+      - name: Prepare target folder (own & clean)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          script_stop: true
+          script: |
+            set -euo pipefail
+            APP_DIR="${APP_DIR:-$HOME/steamdb}"
+            echo "[INFO] Preparing ${APP_DIR} on $(hostname) as $(whoami)"
+            sudo mkdir -p "$APP_DIR"
+            sudo chown -R "$(whoami):$(whoami)" "$APP_DIR"
+            # supprime tout contenu existant et surtout un éventuel .git root
+            rm -rf "$APP_DIR/.git"
+            find "$APP_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+      # 2) UPLOAD: garder source="." mais EXCLURE .git (et quelques bricoles)
+      - name: Upload repo to VM (exclude .git)
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          # fingerprint: ${{ secrets.SSH_FINGERPRINT }}  # décommente si tu l'ajoutes
           port: 22
           source: "."
           target: "${{ env.APP_DIR }}"
           overwrite: true
+          # Exclure .git (et autres dossiers inutiles). scp-action supporte tar_exec.
+          tar_exec: "tar --exclude='.git' --exclude='.github' --exclude='.venv' --exclude='__pycache__' -czf"
 
       - name: Deploy via SSH (Docker & Compose)
         uses: appleboy/ssh-action@v1.0.3
@@ -33,7 +54,6 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          # fingerprint: ${{ secrets.SSH_FINGERPRINT }}
           port: 22
           script_stop: true
           command_timeout: 60m
@@ -49,7 +69,7 @@ jobs:
               sudo apt-get install -y docker.io
               sudo systemctl enable docker
               sudo systemctl start docker
-              sudo usermod -aG docker "$USER" || true
+              sudo usermod -aG docker "$(whoami)" || true
             fi
 
             # 2) Compose v2 (fallback standalone)
