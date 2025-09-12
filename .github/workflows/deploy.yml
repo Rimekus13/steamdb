@@ -3,101 +3,54 @@ name: Deploy to GCE VM
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
+      - name: Checkout (for GITHUB_SHA env only)
         uses: actions/checkout@v4
 
-      # Reconstruire le fichier clé privée à partir du secret base64
-      - name: Recreate SSH key
-        shell: bash
-        run: |
-          if [ -z "${{ secrets.SSH_KEY_BASE64 }}" ]; then
-            echo "❌ Missing secret SSH_KEY_BASE64" >&2
-            exit 1
-          fi
-          echo "${{ secrets.SSH_KEY_BASE64 }}" | base64 -d > gcp_ci
-          chmod 600 gcp_ci
-          echo "Key written to ./gcp_ci"
-
-      - name: Sanity check secrets
-        run: |
-          set -e
-          [ -n "${{ secrets.SSH_HOST }}" ] || { echo "❌ Missing secret SSH_HOST"; exit 1; }
-          [ -n "${{ secrets.SSH_USERNAME }}" ] || { echo "❌ Missing secret SSH_USERNAME"; exit 1; }
-
-      # Déploiement via SSH
-      - name: SSH deploy
+      - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USERNAME }}
-          key_path: ./gcp_ci
-          port: 22
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
           script_stop: true
-          # Le script exécuté sur la VM :
           script: |
             set -e
+            APP_DIR="${APP_DIR:-/home/${{ secrets.SSH_USER }}/steamdb}"
 
-            # 0) Variables
-            APP_DIR="${{ secrets.APP_DIR }}"
-            if [ -z "$APP_DIR" ]; then
-              APP_DIR="/home/${{ secrets.SSH_USERNAME }}/steamdb"
-            fi
-            REPO_URL="https://github.com/${{ github.repository }}"
-            BRANCH="main"
-            REF="${{ github.sha }}"
-
-            echo "APP_DIR=$APP_DIR"
-            echo "Deploy REF=$REF"
-
-            # 1) S'assurer que Docker & Compose sont dispos
-            if ! command -v docker >/dev/null 2>&1; then
-              echo "[INFO] Installing docker.io"
-              sudo apt-get update
-              sudo apt-get install -y docker.io
+            # Install docker-compose standalone if missing
+            if ! command -v docker-compose >/dev/null 2>&1; then
+              echo "[INFO] Installing docker-compose standalone..."
+              COMPOSE_VERSION="v2.28.1"
+              sudo curl -L "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+                -o /usr/local/bin/docker-compose
+              sudo chmod +x /usr/local/bin/docker-compose
             fi
 
-            if docker compose version >/dev/null 2>&1; then
-              COMPOSE="docker compose"
-            elif command -v docker-compose >/dev/null 2>&1; then
-              COMPOSE="docker-compose"
-            else
-              echo "[INFO] Installing docker-compose-plugin"
-              sudo apt-get update
-              sudo apt-get install -y docker-compose-plugin || sudo apt-get install -y docker-compose
-              if docker compose version >/dev/null 2>&1; then
-                COMPOSE="docker compose"
-              else
-                COMPOSE="docker-compose"
-              fi
-            fi
-
-            # 2) Clone initial si besoin
             if [ ! -d "$APP_DIR/.git" ]; then
-              echo "[INFO] Cloning repo in $APP_DIR"
-              mkdir -p "$APP_DIR"
-              git clone "$REPO_URL" "$APP_DIR"
+              git clone https://github.com/${{ github.repository }} "$APP_DIR"
             fi
 
-            # 3) Checkout du commit exact
             cd "$APP_DIR"
             git fetch --all --prune
-            git checkout "$BRANCH" || git checkout -b "$BRANCH"
-            git reset --hard "$REF"
+            git checkout main
+            git reset --hard "${GITHUB_SHA}"
 
-            # 4) Redémarrer la stack
-            $COMPOSE pull || true
-            $COMPOSE down || true
-            $COMPOSE up -d
+            if docker compose version >/dev/null 2>&1; then
+              DC="docker compose"
+            elif docker-compose version >/dev/null 2>&1; then
+              DC="docker-compose"
+            else
+              echo "❌ Docker Compose not found."
+              exit 1
+            fi
 
-            # 5) Sanity check
-            $COMPOSE ps
-
-            # 6) (optionnel) lister les DAGs
-            # $COMPOSE exec -T airflow airflow dags list || true
+            $DC pull || true
+            $DC down || true
+            $DC up -d
+            $DC ps
