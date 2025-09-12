@@ -3,6 +3,8 @@ services:
     image: apache/airflow:2.9.2
     container_name: airflow
     restart: unless-stopped
+
+    # ✅ toutes les variables d'env DOIVENT être sous "environment:"
     environment:
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
@@ -11,21 +13,24 @@ services:
       AIRFLOW__CORE__EXECUTOR: "SequentialExecutor"
       AIRFLOW__WEBSERVER__WEB_SERVER_PORT: "${AIRFLOW_PORT:-8081}"
 
-      # Config ETL
+      # ETL / GCP (prises depuis .env)
       BRONZE_MODE: "gcs"
-    GCP_PROJECT: "${GCP_PROJECT}"
-    GCS_BUCKET: "${GCS_BUCKET}"
-    FIRESTORE_PROJECT: "${FIRESTORE_PROJECT:-$GCP_PROJECT}"
-    APP_IDS_FILE: "${APP_IDS_FILE}"
+      GCP_PROJECT: "${GCP_PROJECT}"
+      GCS_BUCKET: "${GCS_BUCKET}"
+      FIRESTORE_PROJECT: "${FIRESTORE_PROJECT:-${GCP_PROJECT}}"
+      APP_IDS_FILE: "${APP_IDS_FILE}"
 
-    PYTHONPATH: "/opt/airflow"
+      PYTHONPATH: "/opt/airflow"
+
     ports:
       - "${AIRFLOW_PORT:-8081}:${AIRFLOW_PORT:-8081}"
+
     volumes:
       - ./dags:/opt/airflow/dags
       - ./etl:/opt/airflow/etl
       - ./apps.txt:/opt/airflow/apps.txt:ro
       - ./requirements.txt:/opt/airflow/requirements.txt:ro
+
     command: >
       bash -lc '
         set -e
@@ -34,4 +39,3 @@ services:
         (airflow users create --username ${AIRFLOW_USER:-admin} --password ${AIRFLOW_PWD:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com) || true;
         airflow scheduler & exec airflow webserver
       '
-      
