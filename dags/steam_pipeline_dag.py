@@ -26,8 +26,10 @@ with DAG(
 ) as dag:
 
     def extract():
+        print("[DEBUG] app_ids:", Config.app_ids)
+        print("[DEBUG] bucket:", Config.gcs_bucket)
         for app_id in Config.app_ids:
-            extract_app(app_id, mode="incr")
+            extract_app(app_id, mode="incr", pages=2, per_page=100)
 
     def silver():
         dt = datetime.utcnow().strftime("%Y-%m-%d")

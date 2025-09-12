@@ -15,7 +15,7 @@ services:
       BRONZE_MODE: "gcs"
       GCP_PROJECT: "${GCP_PROJECT}"
       GCS_BUCKET: "${GCS_BUCKET}"
-      APPS_FILE: "/opt/airflow/apps.txt"
+      APP_IDS_FILE: "/opt/airflow/apps.txt"
 
       PYTHONPATH: "/opt/airflow"
     ports:
