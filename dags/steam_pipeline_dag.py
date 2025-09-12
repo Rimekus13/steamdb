@@ -44,3 +44,4 @@ with DAG(
     t_gold    = PythonOperator(task_id="build_gold", python_callable=gold)
 
     t_extract >> t_silver >> t_gold
+
