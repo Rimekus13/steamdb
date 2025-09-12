@@ -1,107 +1,70 @@
-name: Deploy to GCE VM
+name: Deploy to VM
 
 on:
   push:
-    branches: ["main"]
-  workflow_dispatch:
+    branches: [ "main" ]
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      APP_DIR: /home/steamdb_ynov/steamdb
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # (Debug) Vois ce que GitHub a bien récupéré
-      - name: Debug workspace tree
-        run: |
-          pwd
-          ls -la
-          find . -maxdepth 2 -type d -print
-
-      # Supprime .git et bricoles côté runner pour éviter les soucis d'untar
-      - name: Remove VCS folders locally
-        run: |
-          set -eu
-          rm -rf .git .github .venv
-          find . -type d -name "__pycache__" -prune -exec rm -rf {} +
-
-      # Prépare la cible sur la VM (sans sudo)
-      - name: Prepare target folder (no sudo)
+      - name: SSH Deploy
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
+          key: ${{ secrets.SSH_KEY }}          # ta clé privée CI/CD
           port: 22
+          # On passe explicitement les variables côté VM :
+          envs: APP_DIR,GCP_PROJECT,GCS_BUCKET,GCP_SA_KEY_B64
           script_stop: true
-          envs: APP_DIR
           script: |
             set -eu
-            APP_DIR="${APP_DIR:-$HOME/steamdb}"
-            echo "[INFO] Preparing ${APP_DIR} on $(hostname) as $(whoami)"
-            mkdir -p "$APP_DIR"
-            rm -rf "$APP_DIR/.git"
-            find "$APP_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-            mkdir -p "$APP_DIR"
 
-      # Upload TOUT le dossier courant (plus simple, plus sûr)
-      - name: Upload project to VM (send current dir)
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: 22
-          target: "${{ env.APP_DIR }}"
-          overwrite: true
-          source: "."
+            # === Paramètres côté VM ===
+            APP_DIR="${APP_DIR:-/steamdb}"   # <-- ton projet est dans /steamdb
+            GCP_PROJECT="${GCP_PROJECT:-}"
+            GCS_BUCKET="${GCS_BUCKET:-}"
+            FIRESTORE_PROJECT="${FIRESTORE_PROJECT:-$GCP_PROJECT}"
 
-      # Déploiement (comme avant)
-      - name: Deploy via SSH (compose)
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: 22
-          script_stop: true
-          command_timeout: 60m
-          envs: APP_DIR,GCP_PROJECT,GCS_BUCKET,FIRESTORE_PROJECT,GCP_SA_KEY
-          script: |
-            set -eu
-            APP_DIR="${APP_DIR:-$HOME/steamdb}"
+            # Vérifs lisibles (échoue proprement si manquant)
+            [ -n "$GCP_PROJECT" ] || { echo "[ERROR] GCP_PROJECT manquant"; exit 1; }
+            [ -n "$GCS_BUCKET" ]  || { echo "[ERROR] GCS_BUCKET manquant";  exit 1; }
+
+            mkdir -p "$APP_DIR"
             cd "$APP_DIR"
 
-            # Fallback Firestore -> GCP_PROJECT
-            if [ -z "${FIRESTORE_PROJECT:-}" ]; then FIRESTORE_PROJECT="${GCP_PROJECT}"; fi
-
             # .env
-            printf "GCP_PROJECT=%s\n" "${GCP_PROJECT}" > .env
-            printf "GCS_BUCKET=%s\n"  "${GCS_BUCKET}"  >> .env
-            printf "FIRESTORE_PROJECT=%s\n" "${FIRESTORE_PROJECT}" >> .env
-            printf "AIRFLOW_PORT=8081\nSTREAMLIT_PORT=8501\n" >> .env
+            {
+              echo "GCP_PROJECT=$GCP_PROJECT"
+              echo "GCS_BUCKET=$GCS_BUCKET"
+              echo "FIRESTORE_PROJECT=$FIRESTORE_PROJECT"
+              echo "AIRFLOW_PORT=8081"
+              echo "STREAMLIT_PORT=8501"
+            } > .env
             echo "[INFO] .env:"
             cat .env
 
-            # Clé service (optionnelle)
-            if [ -n "${GCP_SA_KEY:-}" ]; then
-              printf "%s" "${GCP_SA_KEY}" > gcp-sa.json
+            # Clé de service (option : base64 dans secret GCP_SA_KEY_B64)
+            if [ -n "${GCP_SA_KEY_B64:-}" ]; then
+              echo "$GCP_SA_KEY_B64" | base64 -d > gcp-sa.json
               chmod 600 gcp-sa.json
               echo "[INFO] gcp-sa.json created"
             fi
 
-            # compose
+            # Docker Compose (installe si absent)
             if docker compose version >/dev/null 2>&1; then
               DC="docker compose"
             elif command -v docker-compose >/dev/null 2>&1; then
               DC="docker-compose"
             else
-              echo "[ERROR] docker compose / docker-compose introuvable sur la VM."
-              exit 1
+              echo "[INFO] Installing docker compose plugin..."
+              sudo apt-get update -y
+              sudo apt-get install -y docker-compose-plugin
+              DC="docker compose"
             fi
 
             $DC pull || true
@@ -109,7 +72,7 @@ jobs:
             $DC up -d
             $DC ps
 
-            # Trigger DAG
+            # Airflow: unpause + trigger (nom DAG à adapter si besoin)
             sleep 10
             $DC exec -T airflow airflow dags unpause steam_etl_gcp || true
             $DC exec -T airflow airflow dags trigger steam_etl_gcp || true
