@@ -15,7 +15,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) Préparer la cible (sans sudo)
+      # (Debug) Vois ce que GitHub a bien récupéré
+      - name: Debug workspace tree
+        run: |
+          pwd
+          ls -la
+          find . -maxdepth 2 -type d -print
+
+      # Supprime .git et bricoles côté runner pour éviter les soucis d'untar
+      - name: Remove VCS folders locally
+        run: |
+          set -eu
+          rm -rf .git .github .venv
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} +
+
+      # Prépare la cible sur la VM (sans sudo)
       - name: Prepare target folder (no sudo)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -34,8 +48,8 @@ jobs:
             find "$APP_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
             mkdir -p "$APP_DIR"
 
-      # 2) Upload (whitelist => pas de .git)
-      - name: Upload project to VM (whitelist)
+      # Upload TOUT le dossier courant (plus simple, plus sûr)
+      - name: Upload project to VM (send current dir)
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -44,16 +58,10 @@ jobs:
           port: 22
           target: "${{ env.APP_DIR }}"
           overwrite: true
-          source: |
-            docker-compose.yml
-            requirements.txt
-            apps.txt
-            dags
-            etl
-            streamlit
+          source: "."
 
-      # 3) Déployer + trigger DAG (sans EOF)
-      - name: Deploy and trigger Airflow
+      # Déploiement (comme avant)
+      - name: Deploy via SSH (compose)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -68,26 +76,25 @@ jobs:
             APP_DIR="${APP_DIR:-$HOME/steamdb}"
             cd "$APP_DIR"
 
-            # Fallback Firestore -> GCP_PROJECT si vide
+            # Fallback Firestore -> GCP_PROJECT
             if [ -z "${FIRESTORE_PROJECT:-}" ]; then FIRESTORE_PROJECT="${GCP_PROJECT}"; fi
 
-            # Ecrire .env sans heredoc
+            # .env
             printf "GCP_PROJECT=%s\n" "${GCP_PROJECT}" > .env
             printf "GCS_BUCKET=%s\n"  "${GCS_BUCKET}"  >> .env
             printf "FIRESTORE_PROJECT=%s\n" "${FIRESTORE_PROJECT}" >> .env
             printf "AIRFLOW_PORT=8081\nSTREAMLIT_PORT=8501\n" >> .env
-            echo "[INFO] .env written:"
+            echo "[INFO] .env:"
             cat .env
 
-            # Déposer la clé de service (optionnelle) sans heredoc
+            # Clé service (optionnelle)
             if [ -n "${GCP_SA_KEY:-}" ]; then
-              # écrit le JSON tel quel
               printf "%s" "${GCP_SA_KEY}" > gcp-sa.json
               chmod 600 gcp-sa.json
               echo "[INFO] gcp-sa.json created"
             fi
 
-            # Choisir la commande compose (sans sudo)
+            # compose
             if docker compose version >/dev/null 2>&1; then
               DC="docker compose"
             elif command -v docker-compose >/dev/null 2>&1; then
@@ -97,7 +104,6 @@ jobs:
               exit 1
             fi
 
-            # (Re)lancer
             $DC pull || true
             $DC down || true
             $DC up -d
@@ -108,5 +114,5 @@ jobs:
             $DC exec -T airflow airflow dags unpause steam_etl_gcp || true
             $DC exec -T airflow airflow dags trigger steam_etl_gcp || true
 
-            echo "[INFO] Tail airflow logs (last 100 lines)"
+            echo "[INFO] Airflow logs (last 100)"
             $DC logs --tail=100 airflow || true
