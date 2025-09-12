@@ -1,20 +1,18 @@
-# etl/config.py
 import os
 from pathlib import Path
 
 class Config:
-    # --- Apps à traiter (fichier apps.txt à la racine du repo, 1 app_id par ligne)
-    apps_file = os.getenv("APPS_FILE", "/opt/airflow/apps.txt")  # monté par docker-compose
-    if os.path.exists(apps_file):
-        with open(apps_file, "r", encoding="utf-8") as f:
-            app_ids = [l.strip() for l in f if l.strip()]
+    # Apps
+    app_ids_file = os.getenv("APP_IDS_FILE")
+    app_ids = []
+    if app_ids_file and Path(app_ids_file).exists():
+        app_ids = [l.strip() for l in Path(app_ids_file).read_text().splitlines() if l.strip()]
     else:
-        app_ids = []
+        app_ids = [s.strip() for s in os.getenv("APP_IDS", "").split(",") if s.strip()]
 
-    # --- Bronze: local vs GCS
-    bronze_mode = os.getenv("BRONZE_MODE", "gcs")  # 'local' ou 'gcs'
-    # Chemins/local
-    data_root = Path(os.getenv("DATA_ROOT", "/opt/airflow/data"))
-    # GCS
-    gcp_project = os.getenv("GCP_PROJECT")  # peut être déduit par les creds de la VM
-    gcs_bucket = os.getenv("GCS_BUCKET")    # ex: steam-raw-data-<id>
+    # Bronze → GCS
+    bronze_mode = os.getenv("BRONZE_MODE", "gcs")
+    gcs_bucket  = os.getenv("GCS_BUCKET")
+
+    # Firestore
+    firestore_project = os.getenv("FIRESTORE_PROJECT")
