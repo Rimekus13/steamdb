@@ -12,7 +12,7 @@ class Config:
 
     # Bronze → GCS
     bronze_mode = os.getenv("BRONZE_MODE", "gcs")
-    gcs_bucket  = os.getenv("steam-raw-data")
+    gcs_bucket  = os.getenv("GCS_BUCKET")
 
     # Firestore
     firestore_project = os.getenv("FIRESTORE_PROJECT")
