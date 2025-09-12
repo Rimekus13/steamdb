@@ -13,11 +13,12 @@ services:
 
       # Config ETL
       BRONZE_MODE: "gcs"
-      GCP_PROJECT: "${GCP_PROJECT}"
-      GCS_BUCKET: "${GCS_BUCKET}"
-      APP_IDS_FILE: "/opt/airflow/apps.txt"
+    GCP_PROJECT: "${GCP_PROJECT}"
+    GCS_BUCKET: "${GCS_BUCKET}"
+    FIRESTORE_PROJECT: "${FIRESTORE_PROJECT:-$GCP_PROJECT}"
+    APP_IDS_FILE: "${APP_IDS_FILE}"
 
-      PYTHONPATH: "/opt/airflow"
+    PYTHONPATH: "/opt/airflow"
     ports:
       - "${AIRFLOW_PORT:-8081}:${AIRFLOW_PORT:-8081}"
     volumes:
