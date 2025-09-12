@@ -3,41 +3,49 @@ name: Deploy to VM
 on:
   push:
     branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: SSH Deploy
         uses: appleboy/ssh-action@v1.0.3
+        env:                       # variables injectées depuis secrets
+          APP_DIR: /steamdb
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          GCS_BUCKET:  ${{ secrets.GCS_BUCKET }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}          # ta clé privée CI/CD
+          key: ${{ secrets.SSH_KEY }}
           port: 22
-          # On passe explicitement les variables côté VM :
-          envs: APP_DIR,GCP_PROJECT,GCS_BUCKET,GCP_SA_KEY_B64
+          envs: APP_DIR,GCP_PROJECT,GCS_BUCKET   # exportées vers la session SSH
           script_stop: true
           script: |
             set -eu
+            echo "[INFO] Vars on remote:"
+            echo "  APP_DIR=${APP_DIR-<empty>}"
+            echo "  GCP_PROJECT=${GCP_PROJECT-<empty>}"
+            echo "  GCS_BUCKET=${GCS_BUCKET-<empty>}"
 
-            # === Paramètres côté VM ===
-            APP_DIR="${APP_DIR:-/steamdb}"   # <-- ton projet est dans /steamdb
+            # Définir les valeurs (avec fallback si besoin)
+            APP_DIR="${APP_DIR:-/steamdb}"
             GCP_PROJECT="${GCP_PROJECT:-}"
             GCS_BUCKET="${GCS_BUCKET:-}"
             FIRESTORE_PROJECT="${FIRESTORE_PROJECT:-$GCP_PROJECT}"
 
-            # Vérifs lisibles (échoue proprement si manquant)
             [ -n "$GCP_PROJECT" ] || { echo "[ERROR] GCP_PROJECT manquant"; exit 1; }
             [ -n "$GCS_BUCKET" ]  || { echo "[ERROR] GCS_BUCKET manquant";  exit 1; }
 
             mkdir -p "$APP_DIR"
             cd "$APP_DIR"
 
-            # .env
+            # Génération du fichier .env
             {
               echo "GCP_PROJECT=$GCP_PROJECT"
               echo "GCS_BUCKET=$GCS_BUCKET"
@@ -45,17 +53,9 @@ jobs:
               echo "AIRFLOW_PORT=8081"
               echo "STREAMLIT_PORT=8501"
             } > .env
-            echo "[INFO] .env:"
-            cat .env
+            echo "[INFO] .env:"; cat .env
 
-            # Clé de service (option : base64 dans secret GCP_SA_KEY_B64)
-            if [ -n "${GCP_SA_KEY_B64:-}" ]; then
-              echo "$GCP_SA_KEY_B64" | base64 -d > gcp-sa.json
-              chmod 600 gcp-sa.json
-              echo "[INFO] gcp-sa.json created"
-            fi
-
-            # Docker Compose (installe si absent)
+            # Vérifier Docker Compose
             if docker compose version >/dev/null 2>&1; then
               DC="docker compose"
             elif command -v docker-compose >/dev/null 2>&1; then
@@ -67,16 +67,16 @@ jobs:
               DC="docker compose"
             fi
 
+            # Déploiement
             $DC pull || true
             $DC down || true
             $DC up -d
             $DC ps
 
-            # Airflow: unpause + trigger (nom DAG à adapter si besoin)
+            # Airflow: unpause + trigger DAG
             sleep 10
             $DC exec -T airflow airflow dags unpause steam_etl_gcp || true
             $DC exec -T airflow airflow dags trigger steam_etl_gcp || true
 
             echo "[INFO] Airflow logs (last 100)"
             $DC logs --tail=100 airflow || true
- 
