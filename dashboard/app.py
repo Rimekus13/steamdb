@@ -1,4 +1,4 @@
-# app.py — Clean UI v4 (sidebar with clear sections & dual playtime filter)
+# app.py — Clean UI v4 (Firestore + Gold adaptation)
 import os
 import re
 from datetime import datetime, date, timedelta
@@ -11,31 +11,19 @@ import pandas as pd
 IS_TEST = bool(os.getenv("PYTEST_CURRENT_TEST"))
 
 # -------------------------------------------------
-# Imports "tolérants" (ne doivent pas casser les tests)
+# Imports "tolérants"
 # -------------------------------------------------
 try:
     from config import APP_TITLE, LAYOUT, BASE_CSS
 except Exception:
     APP_TITLE, LAYOUT, BASE_CSS = "Steam Reviews", "wide", ""
 
-# Ces modules peuvent exister dans ton projet ; ils ne déclenchent pas l'UI en mode test
 try:
     from utils import clamp
 except Exception:
-    # fallback minimal pour les tests au cas où utils manque
     def clamp(x, lo, hi):
         return max(lo, min(hi, x))
 
-try:
-    from data_loader import get_db, get_game_name, load_df
-except Exception:
-    # stubs neutres si importé pendant les tests (mais non utilisés)
-    def get_db(): raise RuntimeError("get_db not available in test mode")
-    def get_game_name(app_id): return str(app_id)
-    def load_df(name, db): return pd.DataFrame()
-
-# Ici, on garde la signature telle que dans ton projet réel (UI),
-# mais pendant les tests, on ne passera JAMAIS par ce chemin.
 try:
     from analysis import get_vader, compute_sentiment
 except Exception:
@@ -43,180 +31,94 @@ except Exception:
     def compute_sentiment(*args, **kwargs): return 0.0
 
 # -------------------------------------------------
-# ⚙️ Fonction utilitaire utilisée par les tests (indépendante de Streamlit)
+# 🔗 Firestore client + helpers
 # -------------------------------------------------
-def apply_filters(
-    df: pd.DataFrame,
-    languages=None,
-    date_range=None,          # tuple (start, end) ; accepte str/pd.Timestamp/date
-    sentiment_range=None,     # tuple (lo, hi)
-    search_terms=None         # list[str]
-) -> pd.DataFrame:
+PROJECT = os.getenv("FIRESTORE_PROJECT") or os.getenv("GCP_PROJECT")
+
+def fs_get_db():
     """
-    Version minimaliste, indépendante de Streamlit/config, utilisée par les tests.
-    - Normalise la date vers une colonne 'timestamp' si besoin (à partir de 'review_date').
-    - Applique les filtres de langue, date, sentiment et recherche texte.
+    Client Firestore via ADC (VM GCE / Workload Identity).
+    Ne nécessite PAS de JSON dans le conteneur.
     """
-    out = df.copy()
+    if not PROJECT:
+        raise RuntimeError(
+            "Projet Firestore inconnu. Définis FIRESTORE_PROJECT ou GCP_PROJECT "
+            "dans l'environnement du conteneur."
+        )
+    from google.cloud import firestore
+    return firestore.Client(project=PROJECT)
 
-    # Normaliser la date -> 'timestamp' si absent
-    if "timestamp" in out.columns:
-        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
-    elif "review_date" in out.columns:
-        out["timestamp"] = pd.to_datetime(out["review_date"], errors="coerce")
+def fs_list_app_ids(db, limit_scan: int = 5000):
+    """
+    Détecte les app_ids via les documents top-level de la collection 'reviews_clean'.
+    Schéma Silver: reviews_clean/{app_id}/items/{doc}
+    """
+    cols = db.collection("reviews_clean").list_documents(page_size=limit_scan)
+    app_ids = sorted([doc_ref.id for doc_ref in cols if doc_ref.id and doc_ref.id.isdigit()])
+    return app_ids
 
-    # Langues
-    if languages:
-        out = out[out["language"].isin(languages)]
+def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
+    """
+    Lit la sous-collection 'items' sous reviews_clean/{app_id}.
+    Normalise les colonnes vers les attentes de l’UI.
+    """
+    items_col = db.collection("reviews_clean").document(str(app_id)).collection("items")
+    docs = items_col.limit(limit).stream()
+    rows = [d.to_dict() for d in docs]
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    # Dates
-    if date_range and "timestamp" in out.columns:
-        start, end = date_range
-        start = pd.to_datetime(start)
-        end = pd.to_datetime(end)
-        out = out[(out["timestamp"] >= start) & (out["timestamp"] <= end)]
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "review_date","language","voted_up","cleaned_review","review_text",
+            "compound","playtime_hours","timestamp_created","timestamp_updated","app_id"
+        ])
 
-    # Sentiment
-    if sentiment_range and "sentiment" in out.columns:
-        lo, hi = sentiment_range
-        out = out[(out["sentiment"] >= float(lo)) & (out["sentiment"] <= float(hi))]
-
-    # Recherche texte (sur review_text si dispo, sinon review)
-    if search_terms:
-        base_text = "review_text" if "review_text" in out.columns else ("review" if "review" in out.columns else None)
-        if base_text:
-            mask = pd.Series(False, index=out.index)
-            for term in search_terms:
-                if isinstance(term, str) and term:
-                    mask |= out[base_text].fillna("").str.contains(term, case=False, regex=True)
-            out = out[mask]
-
-    return out
-
-# -------------------------------------------------
-# ❌ Tout ce qui suit (UI Streamlit) NE DOIT PAS s'exécuter sous pytest
-# -------------------------------------------------
-if not IS_TEST:
-    import streamlit as st
-    # Tabs UI (tes modules existants)
-    from tabs import (
-        synthese, sentiment, themes, langues, playtime,
-        longueur, cooccurrences, anomalies, qualite,
-        explorateur, updates
-    )
-    from dotenv import load_dotenv
-    load_dotenv()
-
-    # ---------------------------------------------
-    # Page config & CSS
-    # ---------------------------------------------
-    st.set_page_config(page_title=APP_TITLE, layout=LAYOUT)
-    if BASE_CSS:
-        st.markdown(BASE_CSS, unsafe_allow_html=True)
-
-    # ---------------------------------------------
-    # DB & discovery
-    # ---------------------------------------------
-    db = get_db()
-    all_cols = db.list_collection_names()
-
-    GLOBAL_CLEAN_NAMES = {"reviews_clean", "reviews_clean_airflow", "silver_clean", "clean_reviews"}
-    per_app_cols = [c for c in all_cols if c.startswith("reviews_") and c not in GLOBAL_CLEAN_NAMES]
-    per_app_ids = [c.split("reviews_", 1)[1] for c in per_app_cols]
-    per_app_ids_numeric = sorted([x for x in per_app_ids if x.isdigit()])
-
-    clean_like = [c for c in ["reviews_clean", "reviews_clean_airflow", "silver_clean", "clean_reviews"] if c in all_cols]
-
-    if per_app_ids_numeric:
-        mode = "per_collection"
-        app_ids = per_app_ids_numeric
-    elif clean_like:
-        mode = "single_clean"
-        base_clean = clean_like[0]
-        try:
-            ids = db[base_clean].distinct("app_id") or db[base_clean].distinct("appid") or db[base_clean].distinct("appId")
-            def norm(x):
-                if isinstance(x, int): return str(x) if x > 0 else None
-                if isinstance(x, str) and x.isdigit(): return x
-                return None
-            app_ids = sorted(set(filter(None, (norm(x) for x in ids))))[:3000]
-        except Exception:
-            app_ids = []
+    df = df.copy()
+    # app_id
+    if "app_id" not in df.columns:
+        df["app_id"] = str(app_id)
     else:
-        mode = "none"
-        app_ids = []
+        df["app_id"] = df["app_id"].astype(str)
 
-    with st.expander("🛠️ Debug Mongo", expanded=False):
-        st.write({
-            "db": getattr(db, "name", "?"),
-            "mode": mode,
-            "collections": all_cols[:30],
-            "per_app_ids_numeric": per_app_ids_numeric[:25],
-            "clean_like": clean_like,
-            "num_apps": len(app_ids),
-        })
+    # texte nettoyé -> review_text
+    if "cleaned_review" in df.columns:
+        df["review_text"] = df["cleaned_review"].fillna("").astype(str)
+    else:
+        base_txt = "review"
+        if "review_text" in df.columns:
+            base_txt = "review_text"
+        elif "text" in df.columns:
+            base_txt = "text"
+        df["review_text"] = df.get(base_txt, "").fillna("").astype(str)
 
-    if not app_ids:
-        st.error("Aucun jeu détecté.")
-        st.stop()
+    # langue
+    if "language" not in df.columns:
+        df["language"] = "unknown"
+    else:
+        df["language"] = df["language"].fillna("unknown").astype(str)
 
-    names = {app_id: get_game_name(app_id) for app_id in app_ids}
-    selected_app = st.selectbox("🎮 Jeu", options=app_ids, format_func=lambda a: names.get(a, a))
-    st.markdown(f"### {names.get(selected_app, selected_app)}")
-    st.image(f"https://cdn.akamai.steamstatic.com/steam/apps/{selected_app}/header.jpg", use_container_width=True)
+    # voted_up
+    if "voted_up" not in df.columns:
+        df["voted_up"] = pd.NA
 
-    # ---------------------------------------------
-    # Loading
-    # ---------------------------------------------
-    def fetch_clean_reviews(_db, app_id_str: str) -> pd.DataFrame:
-        targets = [c for c in ["reviews_clean", "reviews_clean_airflow", "silver_clean", "clean_reviews"] if c in _db.list_collection_names()]
-        if not targets:
-            return pd.DataFrame()
-        col = targets[0]
-        ors = [{"app_id": app_id_str}]
-        if app_id_str.isdigit():
-            ors.append({"app_id": int(app_id_str)})
-        q = {"$or": ors}
-        docs = list(_db[col].find(q, {"_id": 0}))
-        return pd.DataFrame(docs)
+    # timestamps -> review_date
+    if "review_date" in df.columns:
+        df["review_date"] = pd.to_datetime(df["review_date"], errors="coerce")
+    elif "timestamp_created" in df.columns:
+        df["review_date"] = pd.to_datetime(df["timestamp_created"], unit="s", errors="coerce")
+    else:
+        df["review_date"] = pd.NaT
 
-    def normalize_from_clean(df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            return pd.DataFrame(columns=[
-                "review_date","language","voted_up","cleaned_review","review_text",
-                "compound","playtime_hours"
-            ])
-        df = df.copy()
+    # sentiment
+    if "compound" in df.columns:
+        df["compound"] = pd.to_numeric(df["compound"], errors="coerce").fillna(0.0)
+    else:
+        df["compound"] = 0.0
 
-        # text
-        if "cleaned_review" in df.columns:
-            df["review_text"] = df["cleaned_review"].fillna("").astype(str)
-        else:
-            df["review_text"] = df.get("review_text", "").fillna("").astype(str)
-
-        # language
-        if "language" not in df.columns:
-            df["language"] = "unknown"
-
-        # voted_up
-        if "voted_up" not in df.columns:
-            df["voted_up"] = pd.NA
-
-        # date
-        if "review_date" in df.columns:
-            df["review_date"] = pd.to_datetime(df["review_date"], errors="coerce")
-        elif "timestamp_created" in df.columns:
-            df["review_date"] = pd.to_datetime(df["timestamp_created"], unit="s", errors="coerce")
-        else:
-            df["review_date"] = pd.NaT
-
-        # sentiment (ETL)
-        if "compound" in df.columns:
-            df["compound"] = pd.to_numeric(df["compound"], errors="coerce").fillna(0.0)
-        else:
-            df["compound"] = 0.0
-
-        # playtime hours
+    # playtime_hours
+    if "playtime_hours" in df.columns:
+        df["playtime_hours"] = pd.to_numeric(df["playtime_hours"], errors="coerce")
+    else:
         if "author" in df.columns:
             try:
                 pt = df["author"].apply(lambda x: x.get("playtime_forever") if isinstance(x, dict) else None)
@@ -232,13 +134,149 @@ if not IS_TEST:
         if "playtime_hours" not in df.columns:
             df["playtime_hours"] = pd.NA
 
-        return df
+    return df
 
-    if mode == "per_collection":
-        df = load_df(f"reviews_{selected_app}", db)
-    else:
-        df = fetch_clean_reviews(db, selected_app)
-        df = normalize_from_clean(df)
+def fs_get_game_name(app_id: str) -> str:
+    return str(app_id)
+
+def fs_fetch_gold_counts(db, app_id: str, window: int | None = None, period: str | None = None, limit: int = 50000) -> pd.DataFrame:
+    """
+    Lit la collection 'cooccurrences_counts' (Gold).
+    Champs attendus: app_id, token_a, token_b, window, count, period
+    """
+    col = db.collection("cooccurrences_counts")
+    q = col.where("app_id", "==", str(app_id))
+    if window is not None:
+        q = q.where("window", "==", int(window))
+    if period:
+        q = q.where("period", "==", period)
+    docs = q.limit(limit).stream()
+    rows = [d.to_dict() for d in docs]
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["app_id","token_a","token_b","window","count","period"])
+    # types
+    if not df.empty:
+        df["window"] = pd.to_numeric(df.get("window", 0), errors="coerce").astype("Int64")
+        df["count"] = pd.to_numeric(df.get("count", 0), errors="coerce").astype("Int64")
+        df["period"] = df.get("period", pd.Series([""]*len(df))).astype(str)
+        df["token_a"] = df.get("token_a", pd.Series([""]*len(df))).astype(str)
+        df["token_b"] = df.get("token_b", pd.Series([""]*len(df))).astype(str)
+    return df
+
+def fs_fetch_gold_percent(db, app_id: str, window: int | None = None, period: str | None = None, limit: int = 50000) -> pd.DataFrame:
+    """
+    Lit la collection 'cooccurrences_percent' (Gold).
+    Champs attendus: app_id, token_a, token_b, window, percent, period
+    """
+    col = db.collection("cooccurrences_percent")
+    q = col.where("app_id", "==", str(app_id))
+    if window is not None:
+        q = q.where("window", "==", int(window))
+    if period:
+        q = q.where("period", "==", period)
+    docs = q.limit(limit).stream()
+    rows = [d.to_dict() for d in docs]
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["app_id","token_a","token_b","window","percent","period"])
+    if not df.empty:
+        df["window"] = pd.to_numeric(df.get("window", 0), errors="coerce").astype("Int64")
+        df["percent"] = pd.to_numeric(df.get("percent", 0.0), errors="coerce")
+        df["period"] = df.get("period", pd.Series([""]*len(df))).astype(str)
+        df["token_a"] = df.get("token_a", pd.Series([""]*len(df))).astype(str)
+        df["token_b"] = df.get("token_b", pd.Series([""]*len(df))).astype(str)
+    return df
+
+# Surcharges
+get_db = fs_get_db
+get_game_name = fs_get_game_name
+
+# -------------------------------------------------
+# ⚙️ Utilitaire test
+# -------------------------------------------------
+def apply_filters(
+    df: pd.DataFrame,
+    languages=None,
+    date_range=None,
+    sentiment_range=None,
+    search_terms=None
+) -> pd.DataFrame:
+    out = df.copy()
+    if "timestamp" in out.columns:
+        out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
+    elif "review_date" in out.columns:
+        out["timestamp"] = pd.to_datetime(out["review_date"], errors="coerce")
+
+    if languages:
+        out = out[out["language"].isin(languages)]
+
+    if date_range and "timestamp" in out.columns:
+        start, end = date_range
+        start = pd.to_datetime(start); end = pd.to_datetime(end)
+        out = out[(out["timestamp"] >= start) & (out["timestamp"] <= end)]
+
+    if sentiment_range and "sentiment" in out.columns:
+        lo, hi = sentiment_range
+        out = out[(out["sentiment"] >= float(lo)) & (out["sentiment"] <= float(hi))]
+
+    if search_terms:
+        base_text = "review_text" if "review_text" in out.columns else ("review" if "review" in out.columns else None)
+        if base_text:
+            mask = pd.Series(False, index=out.index)
+            for term in search_terms:
+                if isinstance(term, str) and term:
+                    mask |= out[base_text].fillna("").str.contains(term, case=False, regex=True)
+            out = out[mask]
+    return out
+
+# -------------------------------------------------
+# ❌ Ne pas exécuter l'UI sous pytest
+# -------------------------------------------------
+if not IS_TEST:
+    import streamlit as st
+    from tabs import (
+        synthese, sentiment as t_sentiment, themes, langues, playtime,
+        longueur, cooccurrences, anomalies, qualite, explorateur, updates
+    )
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    # ---------------------------------------------
+    # Page config & CSS
+    # ---------------------------------------------
+    st.set_page_config(page_title=APP_TITLE, layout=LAYOUT)
+    if BASE_CSS:
+        st.markdown(BASE_CSS, unsafe_allow_html=True)
+
+    # ---------------------------------------------
+    # DB & discovery (Firestore)
+    # ---------------------------------------------
+    try:
+        db = get_db()
+    except Exception as e:
+        st.error(f"Impossible d'initialiser Firestore: {e}")
+        st.stop()
+
+    try:
+        app_ids = fs_list_app_ids(db)
+    except Exception as e:
+        st.error(f"Erreur lors du scan des jeux (reviews_clean): {e}")
+        st.stop()
+
+    if not app_ids:
+        st.error("Aucun jeu détecté dans Firestore (collection 'reviews_clean').")
+        st.stop()
+
+    names = {app_id: get_game_name(app_id) for app_id in app_ids}
+    selected_app = st.selectbox("🎮 Jeu", options=app_ids, index=0, format_func=lambda a: names.get(a, a))
+    st.markdown(f"### {names.get(selected_app, selected_app)}")
+    st.image(f"https://cdn.akamai.steamstatic.com/steam/apps/{selected_app}/header.jpg", use_container_width=True)
+
+    # ---------------------------------------------
+    # Loading (Silver)
+    # ---------------------------------------------
+    try:
+        df = fs_fetch_clean_df(db, selected_app)
+    except Exception as e:
+        st.error(f"Erreur de lecture des avis Silver pour {selected_app}: {e}")
+        st.stop()
 
     if df.empty:
         st.warning("Aucune donnée disponible pour ce jeu."); st.stop()
@@ -250,7 +288,6 @@ if not IS_TEST:
         df["sentiment"] = pd.to_numeric(df["compound"], errors="coerce").fillna(0.0)
     else:
         sia = get_vader()
-        # NOTE: ta signature UI semble être compute_sentiment(sia, text)
         df["sentiment"] = df["review_text"].apply(lambda t: compute_sentiment(sia, t))
 
     def senti_label(x: float) -> str:
@@ -261,8 +298,6 @@ if not IS_TEST:
         except Exception:
             return "neutre"
     df["sentiment_label"] = df["sentiment"].apply(senti_label)
-
-    SENTI_COLORS = {"positif":"#22c55e", "neutre":"#9ca3af", "négatif":"#ef4444"}
 
     # ---------------------------------------------
     # Play profiles
@@ -278,14 +313,15 @@ if not IS_TEST:
             return "Hardcore (>100h)"
         except Exception:
             return "Inconnu"
-    df["play_profile"] = df.get("playtime_hours", pd.Series([np.nan]*len(df))).apply(play_profile)
+    df["playtime_hours"] = pd.to_numeric(df.get("playtime_hours", np.nan), errors="coerce")
+    df["play_profile"] = df["playtime_hours"].apply(play_profile)
 
     # ---------------------------------------------
     # Default dates
     # ---------------------------------------------
     if df["review_date"].notna().any():
-        global_min = df["review_date"].min().date()
-        global_max = df["review_date"].max().date()
+        global_min = pd.to_datetime(df["review_date"], errors="coerce").dropna().min().date()
+        global_max = pd.to_datetime(df["review_date"], errors="coerce").dropna().max().date()
     else:
         global_min = date(2024, 1, 1)
         global_max = datetime.now().date()
@@ -296,26 +332,25 @@ if not IS_TEST:
         st.session_state.date_max = global_max
 
     st.session_state.date_min = clamp(st.session_state.get("date_min", global_min), global_min, global_max)
-    st.session_state.date_max = clamp(st.session_state.get("date_max", global_min), global_min, global_max)
+    st.session_state.date_max = clamp(st.session_state.get("date_max", global_min), global_max, global_max)
     if st.session_state.date_min > st.session_state.date_max:
         st.session_state.date_min, st.session_state.date_max = st.session_state.date_max, st.session_state.date_min
 
     # ---------------------------------------------
-    # Sidebar filters (clearly separated sections)
+    # Sidebar filters
     # ---------------------------------------------
     def render_filters_sidebar(df, global_min, global_max):
         sb = st.sidebar
         sb.header("🧭 Filtres")
 
-        # ========== 🎯 Essentiels ==========
+        # 🎯 Essentiels
         sb.subheader("🎯 Essentiels")
-        # Dates
         dmin = sb.date_input("📅 Depuis", value=st.session_state.date_min,
-                            min_value=global_min, max_value=global_max, key="f_date_min")
+                             min_value=global_min, max_value=global_max, key="f_date_min")
         dmax = sb.date_input("📅 Jusqu’à", value=st.session_state.date_max,
-                            min_value=global_min, max_value=global_max, key="f_date_max")
+                             min_value=global_min, max_value=global_max, key="f_date_max")
         col_q1, col_q2, col_q3 = sb.columns(3)
-        if col_q1.button("7 j", key="f_q7"): 
+        if col_q1.button("7 j", key="f_q7"):
             st.session_state.date_min = max(global_min, global_max - timedelta(days=6)); st.session_state.date_max = global_max; st.rerun()
         if col_q2.button("30 j", key="f_q30"):
             st.session_state.date_min = max(global_min, global_max - timedelta(days=29)); st.session_state.date_max = global_max; st.rerun()
@@ -323,19 +358,17 @@ if not IS_TEST:
             st.session_state.date_min = max(global_min, global_max - timedelta(days=89)); st.session_state.date_max = global_max; st.rerun()
 
         # Langues
-        langs = sorted(df["language"].dropna().unique().tolist())
-        if not langs: langs = ["unknown"]
+        langs = sorted(df["language"].dropna().unique().tolist()) or ["unknown"]
         chosen_langs = sb.multiselect("🌐 Langues", options=langs, default=langs, key="f_langs")
 
         sb.divider()
 
-        # ========== ⏱️ Heures de jeu ==========
+        # ⏱️ Heures de jeu
         sb.subheader("⏱️ Heures de jeu")
         play_mode = sb.radio("Mode", ["Profils prédéfinis", "Plage d'heures"], key="f_play_mode", horizontal=True)
 
         ALL_PROFILES = ["Découverte (≤1h)","Casual (1–5h)","Régulier (5–20h)","Core (20–100h)","Hardcore (>100h)","Inconnu"]
-        present_profiles = [p for p in ALL_PROFILES if p in df.get("play_profile", pd.Series(dtype=str)).unique().tolist()]
-        if not present_profiles: present_profiles = ["Inconnu"]
+        present_profiles = [p for p in ALL_PROFILES if p in df.get("play_profile", pd.Series(dtype=str)).unique().tolist()] or ["Inconnu"]
 
         chosen_profiles = None
         hours_min = None
@@ -346,32 +379,41 @@ if not IS_TEST:
             chosen_profiles = sb.multiselect("👤 Profils", options=ALL_PROFILES, default=present_profiles, key="f_profiles")
         else:
             h_series = pd.to_numeric(df.get("playtime_hours", pd.Series(dtype=float)), errors="coerce")
-            hmin = int(np.nanmin(h_series)) if h_series.notna().any() else 0
-            hmax_raw = int(np.nanmax(h_series)) if h_series.notna().any() else 0
+            if h_series.notna().any():
+                hmin = int(np.nanmin(h_series)); hmax_raw = int(np.nanmax(h_series))
+            else:
+                hmin, hmax_raw = 0, 0
             hmax = max(hmin + 1, int(np.ceil(hmax_raw / 10) * 10) if hmax_raw > 0 else 10)
-            default_low = hmin
-            default_high = hmax_raw if hmax_raw > hmin else hmax
+            default_low, default_high = hmin, (hmax_raw if hmax_raw > hmin else hmax)
             hours_min, hours_max = sb.slider("Plage (heures)", min_value=hmin, max_value=hmax,
-                                            value=(int(default_low), int(default_high)), step=1, key="f_play_range")
+                                             value=(int(default_low), int(default_high)), step=1, key="f_play_range")
             include_unknown = sb.checkbox("Inclure 'Inconnu'", value=False, key="f_play_inc_unknown")
 
         sb.divider()
 
-        # ========== 🙂 Sentiment ==========
+        # 🙂 Sentiment
         sb.subheader("🙂 Sentiment")
         senti_choice = sb.radio("", options=["Tous", "Positifs", "Neutres", "Négatifs"],
                                 index=0, key="f_senti", horizontal=True)
 
         sb.divider()
 
-        # ========== 🔎 Mots-clés ==========
+        # 🔎 Mots-clés
         sb.subheader("🔎 Mots-clés")
         keywords_raw = sb.text_input("Ex: bug, crash", key="f_keywords")
         match_all = sb.checkbox("ET logique (tous les mots)", value=False, key="f_keywords_all")
 
         sb.divider()
 
-        # ========== ⚙️ Actions ==========
+        # 🟡 Gold (cooccurrences) — filtres rapides
+        sb.subheader("🔗 Cooccurrences (Gold)")
+        gold_window = sb.number_input("Fenêtre", value=5, min_value=2, max_value=20, step=1, key="f_gold_window")
+        gold_period = sb.text_input("Période (YYYY-MM, vide=Toutes)", value="", key="f_gold_period")
+        gold_topk = sb.number_input("Top K (0 = tous)", value=50, min_value=0, step=10, key="f_gold_topk")
+
+        sb.divider()
+
+        # ⚙️ Actions
         sb.subheader("⚙️ Actions")
         hard_refresh = sb.checkbox("🧹 Purger le cache avant calcul", value=False, key="f_hard_refresh")
         col_a, col_b = sb.columns(2)
@@ -388,6 +430,9 @@ if not IS_TEST:
             st.session_state.f_keywords = ""
             st.session_state.f_keywords_all = False
             st.session_state.f_hard_refresh = False
+            st.session_state.f_gold_window = 5
+            st.session_state.f_gold_period = ""
+            st.session_state.f_gold_topk = 50
             st.rerun()
 
         if apply_clicked:
@@ -409,6 +454,9 @@ if not IS_TEST:
             "include_unknown": include_unknown,
             "keywords_raw": keywords_raw,
             "match_all": match_all,
+            "gold_window": int(gold_window),
+            "gold_period": gold_period.strip() or None,
+            "gold_topk": int(gold_topk),
         }
 
     flt = render_filters_sidebar(df, global_min, global_max)
@@ -434,7 +482,7 @@ if not IS_TEST:
         if flt["chosen_profiles"]:
             mask &= df["play_profile"].isin(flt["chosen_profiles"])
     else:
-        ph = pd.to_numeric(df["playtime_hours"], errors="coerce") if "playtime_hours" in df.columns else pd.Series(index=df.index, dtype=float)
+        ph = pd.to_numeric(df["playtime_hours"], errors="coerce")
         in_range = ph.between(flt["hours_min"], flt["hours_max"], inclusive="both")
         if flt["include_unknown"]:
             in_range = in_range | ph.isna()
@@ -465,7 +513,7 @@ if not IS_TEST:
     st.caption(
         f"🗓️ **{st.session_state.date_min} → {st.session_state.date_max}** • "
         f"{play_txt} • "
-        f"Avis filtrés : **{len(df_f):,}**"
+        f"Avis filtrés : **{len(df_f):,}** • Projet Firestore: **{PROJECT}**"
     )
 
     # ---------------------------------------------
@@ -490,6 +538,22 @@ if not IS_TEST:
         rows.append((th, freq))
     freq_df = pd.DataFrame(rows, columns=["Thème","Fréquence (%)"]).sort_values("Fréquence (%)", ascending=False)
 
+    # ---------------------------------------------
+    # GOLD — cooccurrences Firestore
+    # ---------------------------------------------
+    try:
+        gold_counts_df = fs_fetch_gold_counts(db, selected_app, window=flt["gold_window"], period=flt["gold_period"])
+        gold_percent_df = fs_fetch_gold_percent(db, selected_app, window=flt["gold_window"], period=flt["gold_period"])
+        # Optionnel Top-K côté UI
+        if not gold_counts_df.empty and flt["gold_topk"] > 0:
+            gold_counts_df = gold_counts_df.sort_values(["count"], ascending=False).head(flt["gold_topk"])
+        if not gold_percent_df.empty and flt["gold_topk"] > 0:
+            gold_percent_df = gold_percent_df.sort_values(["percent"], ascending=False).head(flt["gold_topk"])
+    except Exception as e:
+        st.warning(f"Gold indisponible: {e}")
+        gold_counts_df = pd.DataFrame(columns=["app_id","token_a","token_b","window","count","period"])
+        gold_percent_df = pd.DataFrame(columns=["app_id","token_a","token_b","window","percent","period"])
+
     # Tabs
     tabs = st.tabs([
         "📌 Synthèse","🙂 Sentiment","🧩 Thèmes","🌍 Langues","⏱️ Heures de jeu",
@@ -500,16 +564,22 @@ if not IS_TEST:
         "df": df, "df_f": df_f,
         "pos": pos, "neu": neu, "neg": neg, "avg_len": avg_len,
         "theme_dict": theme_dict, "freq_df": freq_df,
-        "sentiment_colors": {"positif":"#22c55e","neutre":"#9ca3af","négatif":"#ef4444"}
+        "sentiment_colors": {"positif":"#22c55e","neutre":"#9ca3af","négatif":"#ef4444"},
+        # GOLD:
+        "gold_counts_df": gold_counts_df,
+        "gold_percent_df": gold_percent_df,
+        # Pour info si tes tabs veulent les filtres:
+        "gold_window": flt["gold_window"],
+        "gold_period": flt["gold_period"],
     }
 
     with tabs[0]: synthese.render(st, ctx)
-    with tabs[1]: sentiment.render(st, ctx)
+    with tabs[1]: t_sentiment.render(st, ctx)
     with tabs[2]: themes.render(st, ctx)
     with tabs[3]: langues.render(st, ctx)
     with tabs[4]: playtime.render(st, ctx)
     with tabs[5]: longueur.render(st, ctx)
-    with tabs[6]: cooccurrences.render(st, ctx)
+    with tabs[6]: cooccurrences.render(st, ctx)   # lit ctx["gold_counts_df"] / ctx["gold_percent_df"]
     with tabs[7]: anomalies.render(st, ctx)
     with tabs[8]: qualite.render(st, ctx)
     with tabs[9]: explorateur.render(st, ctx)
