@@ -23,6 +23,7 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}   # <-- AJOU
           port: 22
           envs: APP_DIR,GCP_PROJECT,GCS_BUCKET   # exportées vers la session SSH
           script_stop: true
