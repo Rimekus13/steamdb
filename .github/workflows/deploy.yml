@@ -116,7 +116,3 @@ jobs:
 
             echo "[INFO] Airflow logs (last 100)"
             $DC logs --tail=100 airflow || true
-
-
-#
-
