@@ -3,54 +3,96 @@ name: Deploy to GCE VM
 on:
   push:
     branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (for GITHUB_SHA env only)
+      - name: Checkout (CI side)
         uses: actions/checkout@v4
 
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT }}
+          host: ${{ secrets.SSH_HOST }}         # ex: 35.204.xx.yy
+          username: ${{ secrets.SSH_USER }}     # ex: steamdb_ynov
+          key: ${{ secrets.SSH_KEY }}           # colle la clé privée ENTIEREMENT
+          port: 22
           script_stop: true
+          # On passe la révision à déployer et l'APP_DIR en variables d'env
+          envs: REF,APP_DIR
+          # CI -> VM
+          # REF = commit courant; APP_DIR = dossier cible sur la VM
+          # (mets la même valeur que ton user GCE)
           script: |
             set -e
-            APP_DIR="${APP_DIR:-/home/${{ secrets.SSH_USER }}/steamdb}"
 
-            # Install docker-compose standalone if missing
+            REF="${{ github.sha }}"
+            APP_DIR="${{ secrets.APP_DIR }}"   # ex: /home/steamdb_ynov/steamdb
+            if [ -z "$APP_DIR" ]; then
+              # fallback si pas de secret APP_DIR
+              APP_DIR="/home/${{ secrets.SSH_USER }}/steamdb"
+            fi
+
+            echo "[INFO] Using APP_DIR=$APP_DIR"
+            echo "[INFO] Target REF=${REF:-<empty>} (will fallback to origin/main if empty)"
+
+            # Installer docker-compose standalone si nécessaire
             if ! command -v docker-compose >/dev/null 2>&1; then
               echo "[INFO] Installing docker-compose standalone..."
               COMPOSE_VERSION="v2.28.1"
-              sudo curl -L "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
-                -o /usr/local/bin/docker-compose
+              sudo curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
               sudo chmod +x /usr/local/bin/docker-compose
             fi
 
+            # Installer Docker si besoin (très simple guard)
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "[INFO] Installing Docker..."
+              # Ubuntu (rapide, minimal) :
+              # NB: si ton image est spéciale, adapte au guide Docker officiel.
+              sudo apt-get update -y
+              sudo apt-get install -y docker.io
+              sudo usermod -aG docker $USER || true
+            fi
+
+            # Clone initial si besoin
             if [ ! -d "$APP_DIR/.git" ]; then
+              echo "[INFO] Cloning repo..."
               git clone https://github.com/${{ github.repository }} "$APP_DIR"
             fi
 
             cd "$APP_DIR"
+            git remote set-url origin https://github.com/${{ github.repository }}
             git fetch --all --prune
-            git checkout main
-            git reset --hard "${GITHUB_SHA}"
 
+            # Si REF est vide (cas rare), on prend la pointe de origin/main
+            if [ -z "$REF" ]; then
+              REF="$(git rev-parse origin/main)"
+              echo "[WARN] REF was empty. Fallback to $REF"
+            fi
+
+            echo "[INFO] Checking out main and resetting to $REF"
+            git checkout -B main origin/main || git checkout main
+            git reset --hard "$REF"
+
+            # Choisir la bonne commande Compose (v2 ou standalone)
             if docker compose version >/dev/null 2>&1; then
               DC="docker compose"
             elif docker-compose version >/dev/null 2>&1; then
               DC="docker-compose"
             else
-              echo "❌ Docker Compose not found."
+              echo "❌ Docker Compose introuvable."
               exit 1
             fi
 
+            # Lancement/Reload de la stack
             $DC pull || true
             $DC down || true
             $DC up -d
+
+            echo "[INFO] Current containers:"
             $DC ps
+
+            # Optionnel : vérifier que le DAG est visible
+            # $DC exec -T airflow airflow dags list || true
