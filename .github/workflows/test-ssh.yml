@@ -1,0 +1,69 @@
+name: Test SSH to VM
+
+on:
+  workflow_dispatch: {}   # lancement manuel depuis l'onglet Actions
+
+jobs:
+  ssh-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
+
+      # ✅ Test de connexion SSH simple + infos système
+      - name: Test SSH connection
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}       # ex: 34.155.21.216
+          username: ${{ secrets.SSH_USER }}   # ex: steamdb_ynov
+          key: ${{ secrets.SSH_KEY }}         # contenu de ta clé privée id_ci
+          port: 22
+          script_stop: true
+          script: |
+            set -eu
+            echo "[OK] Connected to $(hostname) as $(whoami)"
+            echo "[INFO] Date: $(date)"
+            echo "[INFO] Uname: $(uname -a)"
+            echo "[INFO] Home: $HOME"
+            echo "[INFO] Shell: $SHELL || true"
+
+      # ✅ Écriture d’un fichier témoin sur la VM (preuve d'accès)
+      - name: Write probe file on VM
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          script_stop: true
+          script: |
+            set -eu
+            PROBE="$HOME/ci_test_$(date +%Y%m%d_%H%M%S).txt"
+            echo "Hello from GitHub Actions at $(date)" > "$PROBE"
+            ls -la "$HOME" | sed -n '1,50p'
+            echo "[OK] Probe file created: $PROBE"
+
+      # (Optionnel) Vérifier Docker/Compose déjà installés
+      - name: Check Docker availability (optional)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          script_stop: true
+          script: |
+            set -eu
+            if command -v docker >/dev/null 2>&1; then
+              echo "[INFO] Docker: $(docker --version)"
+            else
+              echo "[WARN] Docker not found on VM"
+            fi
+            if docker compose version >/dev/null 2>&1; then
+              echo "[INFO] docker compose plugin: OK"
+            elif command -v docker-compose >/dev/null 2>&1; then
+              echo "[INFO] docker-compose standalone: $(docker-compose --version)"
+            else
+              echo "[WARN] docker compose not found on VM"
+            fi
