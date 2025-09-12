@@ -18,6 +18,7 @@ jobs:
           host: ${{ secrets.SSH_HOST }}       # ex: 34.155.21.216
           username: ${{ secrets.SSH_USER }}   # ex: steamdb_ynov
           key: ${{ secrets.SSH_KEY }}         # contenu de ta clé privée id_ci
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}   # <-- AJOU
           port: 22
           script_stop: true
           script: |
