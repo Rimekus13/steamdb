@@ -1,17 +1,22 @@
 # etl/gold_build.py
+from __future__ import annotations
+
 import pandas as pd
 from datetime import datetime
-from typing import List, Iterable, Tuple, Optional
+from typing import List, Iterable, Tuple, Optional, Dict
+from collections import defaultdict
 
 from .text_utils import tokenize_no_stop
 from .firestore_utils import col_clean_query, replace_collection
 
-WINDOW = 5                   # taille de fenêtre de cooccurrence (glissante)
-TOP_K: Optional[int] = None  # None = pas de coupe ; sinon limite le nb de lignes insérées
+# ===== Réglages =====
+WINDOW = 5                   # fenêtre de cooccurrence (glissante)
+TOP_K: Optional[int] = None  # None = pas de coupe ; sinon limite par groupe (app_id, period)
+FIELD_CLEAN = ("cleaned_review", "cleaned_text", "review_clean")  # champs possibles du SILVER
 
 
-def _period_from_row(row) -> Optional[str]:
-    """Prend review_date si dispo (YYYY-MM-DD) sinon fallback sur timestamp_created → YYYY-MM."""
+def _period_from_row(row: Dict) -> Optional[str]:
+    """Prend review_date (YYYY-MM-DD) si dispo, sinon timestamp_created → YYYY-MM."""
     rd = row.get("review_date")
     if isinstance(rd, str) and len(rd) >= 7:
         return rd[:7]
@@ -34,92 +39,112 @@ def _pairs_within_window(tokens: List[str], window: int = WINDOW) -> Iterable[Tu
             b = tokens[j]
             if a != b:
                 # ordre normalisé pour éviter (a,b) / (b,a) en double
-                yield tuple(sorted((a, b)))
+                yield a if a < b else b, b if a < b else a
 
 
 def _read_clean_all() -> pd.DataFrame:
-    """Lit l'intégralité de la collection Firestore 'reviews_clean'."""
-    rows = col_clean_query()
+    """
+    Lit la collection Firestore 'reviews_clean' (via util fourni) et renvoie un DataFrame.
+    col_clean_query() doit renvoyer un iterable de dicts :
+      { app_id: "...", review_date: "...", timestamp_created: ..., cleaned_review|cleaned_text: "..." , ...}
+    """
+    rows = list(col_clean_query())  # si gros volume, on peut streamer par batch et agréger (voir NOTE plus bas)
     return pd.DataFrame(rows)
+
+
+def _choose_clean_text(row: Dict) -> str:
+    for k in FIELD_CLEAN:
+        v = row.get(k)
+        if isinstance(v, str):
+            return v
+    return ""
 
 
 def build_gold(app_ids: Optional[List[str]] = None, for_airflow: bool = False) -> None:
     """
-    Calcule les tables Gold et remplace complètement les collections Firestore :
-      - cooccurrences_counts: {app_id, token_a, token_b, window, count, period}
+    Calcule les tables Gold et remplace les collections Firestore :
+      - cooccurrences_counts:  {app_id, token_a, token_b, window, count,  period}
       - cooccurrences_percent: {app_id, token_a, token_b, window, percent, period}
 
-    Si app_ids est fourni, on filtre le calcul à ces jeux ; sinon on prend tous les app_id présents en SILVER.
+    Si app_ids est fourni, filtre sur ces jeux. Sinon, prend tout le SILVER.
     """
     df = _read_clean_all()
-    if df.empty or "cleaned_review" not in df.columns:
-        replace_collection("cooccurrences_counts", [])
-        replace_collection("cooccurrences_percent", [])
-        return
-
-    # Normalisations de base
-    df["app_id"] = df.get("app_id", "").astype(str)
-    df["tokens"] = df["cleaned_review"].fillna("").map(tokenize_no_stop)
-    df["period"] = df.apply(_period_from_row, axis=1)
-
-    # Filtrages
-    df = df[(df["tokens"].map(len) >= 2) & df["period"].notna() & df["app_id"].ne("")]
     if df.empty:
         replace_collection("cooccurrences_counts", [])
         replace_collection("cooccurrences_percent", [])
         return
 
-    # Filtre optionnel par app_ids
-    if app_ids:
-        allow = {str(a) for a in app_ids}
-        df = df[df["app_id"].isin(allow)]
-        if df.empty:
-            replace_collection("cooccurrences_counts", [])
-            replace_collection("cooccurrences_percent", [])
-            return
+    # Normalisations de base
+    if "app_id" not in df.columns:
+        df["app_id"] = ""
 
-    # Génération des paires (ligne → paires dans fenêtre), puis agrégation globale
-    records = []
-    for _, row in df.iterrows():
-        app_id = row["app_id"]
-        period = row["period"]
-        toks = row["tokens"]
-        for a, b in _pairs_within_window(toks, window=WINDOW):
-            records.append((app_id, period, a, b, 1))
-
-    if not records:
+    # sélection du champ de texte nettoyé (supporte plusieurs noms)
+    if not any(c in df.columns for c in FIELD_CLEAN):
+        # rien à traiter
         replace_collection("cooccurrences_counts", [])
         replace_collection("cooccurrences_percent", [])
         return
 
-    rec_df = pd.DataFrame(records, columns=["app_id", "period", "token_a", "token_b", "count"])
-    co_counts = (rec_df
-                 .groupby(["app_id", "period", "token_a", "token_b"], as_index=False)["count"]
-                 .sum())
+    # Construire tokens + period de façon robuste
+    # (on évite apply python sur toute la DF si très grande : on passe par itertuples)
+    app_ids_allow = set(str(a) for a in app_ids) if app_ids else None
 
-    # Totaux par (app_id, period) pour le pourcentage
-    totals = (co_counts
-              .groupby(["app_id", "period"], as_index=False)["count"]
-              .sum()
-              .rename(columns={"count": "total_pairs"}))
+    # Compteurs groupés : (app_id, period, token_a, token_b) -> count
+    counts = defaultdict(int)
+    totals_per_group = defaultdict(int)  # (app_id, period) -> total pairs
 
-    co_pct = co_counts.merge(totals, on=["app_id", "period"], how="left")
-    co_pct["percent"] = (co_pct["count"] / co_pct["total_pairs"]).fillna(0.0)
-    co_pct = co_pct.drop(columns=["total_pairs"])
+    for row in df.to_dict("records"):
+        aid = str(row.get("app_id", "") or "")
+        if app_ids_allow is not None and aid not in app_ids_allow:
+            continue
 
-    # Coupe optionnelle
-    if TOP_K is not None and len(co_counts) > TOP_K:
-        co_counts = co_counts.nlargest(TOP_K, "count")
-    if TOP_K is not None and len(co_pct) > TOP_K:
-        co_pct = co_pct.nlargest(TOP_K, "percent")
+        period = _period_from_row(row)
+        if not period or not aid:
+            continue
 
-    # Ajoute window + ordre colonnes
-    co_counts["window"] = WINDOW
-    co_pct["window"] = WINDOW
+        txt = _choose_clean_text(row)
+        toks = tokenize_no_stop((txt or "").strip())
+        if len(toks) < 2:
+            continue
 
-    co_counts = co_counts[["app_id", "token_a", "token_b", "window", "count", "period"]]
-    co_pct    = co_pct   [["app_id", "token_a", "token_b", "window", "percent", "period"]]
+        # pairs
+        n_this = 0
+        for a, b in _pairs_within_window(toks, window=WINDOW):
+            counts[(aid, period, a, b)] += 1
+            n_this += 1
+        totals_per_group[(aid, period)] += n_this
 
-    # Remplacement complet des collections Firestore
+    if not counts:
+        replace_collection("cooccurrences_counts", [])
+        replace_collection("cooccurrences_percent", [])
+        return
+
+    # Conversion en DataFrame
+    rec_df = pd.DataFrame(
+        [(k[0], k[1], k[2], k[3], v) for k, v in counts.items()],
+        columns=["app_id", "period", "token_a", "token_b", "count"]
+    )
+
+    # TOP-K par (app_id, period) si demandé
+    if TOP_K is not None:
+        rec_df = (rec_df.sort_values(["app_id", "period", "count"], ascending=[True, True, False])
+                        .groupby(["app_id", "period"], as_index=False, group_keys=False)
+                        .head(TOP_K))
+
+    # Percent
+    rec_df["window"] = WINDOW
+    # Map totals
+    rec_df["total_pairs"] = rec_df.apply(
+        lambda r: totals_per_group.get((r["app_id"], r["period"]), 0),
+        axis=1
+    )
+    rec_df["percent"] = (rec_df["count"] / rec_df["total_pairs"]).fillna(0.0)
+
+    # Ordonner colonnes pour export
+    co_counts = rec_df[["app_id", "token_a", "token_b", "window", "count", "period"]].copy()
+    co_pct    = rec_df[["app_id", "token_a", "token_b", "window", "percent", "period"]].copy()
+
+    # Ecriture Firestore (remplacement total)
+    # NOTE: replace_collection doit gérer l'effacement + insertion batch (limites ~500 ops/batch).
     replace_collection("cooccurrences_counts", co_counts.to_dict("records"))
     replace_collection("cooccurrences_percent", co_pct.to_dict("records"))
