@@ -15,8 +15,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) PREP: clean dossier cible + droits (supprime ancien .git)
-      - name: Prepare target folder (own & clean, no sudo)
+      # 1) Préparer la cible (sans sudo)
+      - name: Prepare target folder (no sudo)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -24,34 +24,36 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: 22
           script_stop: true
+          envs: APP_DIR
           script: |
-            set -euo pipefail
+            set -eu
             APP_DIR="${APP_DIR:-$HOME/steamdb}"
             echo "[INFO] Preparing ${APP_DIR} on $(hostname) as $(whoami)"
-            # créer le dossier dans $HOME (pas besoin de sudo)
             mkdir -p "$APP_DIR"
-            # supprimer un ancien .git et TOUT nettoyer
             rm -rf "$APP_DIR/.git"
             find "$APP_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-            # arbo minimale
             mkdir -p "$APP_DIR"
-            ls -la "$APP_DIR"
 
-
-      # 2) UPLOAD: garder source="." mais EXCLURE .git (et quelques bricoles)
-      - name: Upload repo to VM (exclude .git)
+      # 2) Upload (whitelist => pas de .git)
+      - name: Upload project to VM (whitelist)
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           port: 22
-          source: "."
           target: "${{ env.APP_DIR }}"
           overwrite: true
-          tar_exec: "tar --exclude='.git' --exclude='.github' --exclude='.venv' --exclude='__pycache__' -czf"
+          source: |
+            docker-compose.yml
+            requirements.txt
+            apps.txt
+            dags
+            etl
+            streamlit
 
-      - name: Deploy via SSH (no sudo)
+      # 3) Déployer + trigger DAG (sans EOF)
+      - name: Deploy and trigger Airflow
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -60,23 +62,51 @@ jobs:
           port: 22
           script_stop: true
           command_timeout: 60m
+          envs: APP_DIR,GCP_PROJECT,GCS_BUCKET,FIRESTORE_PROJECT,GCP_SA_KEY
           script: |
-            set -euo pipefail
+            set -eu
             APP_DIR="${APP_DIR:-$HOME/steamdb}"
             cd "$APP_DIR"
-      
-            # choisir la commande compose dispo
+
+            # Fallback Firestore -> GCP_PROJECT si vide
+            if [ -z "${FIRESTORE_PROJECT:-}" ]; then FIRESTORE_PROJECT="${GCP_PROJECT}"; fi
+
+            # Ecrire .env sans heredoc
+            printf "GCP_PROJECT=%s\n" "${GCP_PROJECT}" > .env
+            printf "GCS_BUCKET=%s\n"  "${GCS_BUCKET}"  >> .env
+            printf "FIRESTORE_PROJECT=%s\n" "${FIRESTORE_PROJECT}" >> .env
+            printf "AIRFLOW_PORT=8081\nSTREAMLIT_PORT=8501\n" >> .env
+            echo "[INFO] .env written:"
+            cat .env
+
+            # Déposer la clé de service (optionnelle) sans heredoc
+            if [ -n "${GCP_SA_KEY:-}" ]; then
+              # écrit le JSON tel quel
+              printf "%s" "${GCP_SA_KEY}" > gcp-sa.json
+              chmod 600 gcp-sa.json
+              echo "[INFO] gcp-sa.json created"
+            fi
+
+            # Choisir la commande compose (sans sudo)
             if docker compose version >/dev/null 2>&1; then
               DC="docker compose"
             elif command -v docker-compose >/dev/null 2>&1; then
               DC="docker-compose"
             else
-              echo "[ERROR] docker compose / docker-compose introuvable et pas de sudo pour installer."
+              echo "[ERROR] docker compose / docker-compose introuvable sur la VM."
               exit 1
             fi
-      
+
+            # (Re)lancer
             $DC pull || true
             $DC down || true
             $DC up -d
             $DC ps
 
+            # Trigger DAG
+            sleep 10
+            $DC exec -T airflow airflow dags unpause steam_etl_gcp || true
+            $DC exec -T airflow airflow dags trigger steam_etl_gcp || true
+
+            echo "[INFO] Tail airflow logs (last 100 lines)"
+            $DC logs --tail=100 airflow || true
