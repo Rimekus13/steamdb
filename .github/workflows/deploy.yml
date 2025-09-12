@@ -1,23 +1,80 @@
+name: Deploy to GCE VM
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      # Chemin du repo sur ta VM GCE
+      APP_DIR: /home/steamdb_ynov/steamdb
+
+    steps:
+      - name: Checkout (for GITHUB_SHA)
+        uses: actions/checkout@v4
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
+          host: ${{ secrets.SSH_HOST }}      # ex: 35.195.116.182
+          username: ${{ secrets.SSH_USER }}  # ex: steamdb_ynov
+          key: ${{ secrets.SSH_KEY }}        # contenu de la clé privée (OpenSSH)
           port: 22
           script_stop: true
+          command_timeout: 60m
           script: |
-            cd ~/steamdb || git clone https://github.com/${GITHUB_REPOSITORY} ~/steamdb
-            cd ~/steamdb
-            git fetch --all
-            git checkout main
-            git reset --hard ${{ github.sha }}
+            set -euo pipefail
+            echo "[INFO] Host: $(hostname) | User: $(whoami)"
 
-            if ! command -v docker-compose >/dev/null 2>&1; then
-              sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+            REF="${GITHUB_SHA}"
+            APP_DIR="${APP_DIR:-$HOME/steamdb}"
+            echo "[INFO] APP_DIR=$APP_DIR | REF=$REF"
+
+            # 1) Installer Docker si absent
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "[INFO] Installing Docker..."
+              sudo apt-get update -y
+              sudo apt-get install -y docker.io
+              sudo systemctl enable docker
+              sudo systemctl start docker
+              sudo usermod -aG docker "$USER" || true
+            fi
+
+            # 2) Installer docker-compose v2 standalone si absent
+            if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
+              echo "[INFO] Installing docker-compose standalone..."
+              COMPOSE_VERSION="v2.28.1"
+              sudo curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
                 -o /usr/local/bin/docker-compose
               sudo chmod +x /usr/local/bin/docker-compose
             fi
 
-            docker-compose down || true
-            docker-compose up -d
+            # 3) Clone initial si besoin
+            if [ ! -d "$APP_DIR/.git" ]; then
+              echo "[INFO] Cloning repo in $APP_DIR..."
+              git clone "https://github.com/${GITHUB_REPOSITORY}" "$APP_DIR"
+            fi
+
+            # 4) Se caler sur la même révision que la CI
+            cd "$APP_DIR"
+            git fetch --all --prune
+            git checkout -B main origin/main || git checkout main
+            git reset --hard "$REF"
+
+            # 5) Choisir la bonne commande compose
+            if docker compose version >/dev/null 2>&1; then
+              DC="docker compose"
+            else
+              DC="docker-compose"
+            fi
+
+            # 6) Redémarrer la stack
+            $DC pull || true
+            $DC down || true
+            $DC up -d
+
+            # 7) Sanity
+            $DC ps
