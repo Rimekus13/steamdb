@@ -1,18 +1,3 @@
-name: Deploy to GCE VM
-
-on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch:
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout (for env/sha)
-        uses: actions/checkout@v4
-
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -22,64 +7,17 @@ jobs:
           port: 22
           script_stop: true
           script: |
-            set -e
+            cd ~/steamdb || git clone https://github.com/${GITHUB_REPOSITORY} ~/steamdb
+            cd ~/steamdb
+            git fetch --all
+            git checkout main
+            git reset --hard ${{ github.sha }}
 
-            # 0) Contexte
-            REF="${GITHUB_SHA}"
-            APP_DIR="${APP_DIR:-$HOME/steamdb}"
-            echo "[INFO] APP_DIR=$APP_DIR"
-            echo "[INFO] REF=$REF"
-
-            # 1) Install Docker si absent
-            if ! command -v docker >/dev/null 2>&1; then
-              echo "[INFO] Installing Docker..."
-              sudo apt-get update -y
-              sudo apt-get install -y docker.io
-              sudo systemctl enable docker
-              sudo systemctl start docker
-              # Ajoute l'utilisateur courant au groupe docker (effet au prochain login)
-              sudo usermod -aG docker "$USER" || true
-            fi
-
-            # 2) docker-compose (v2 standalone) si absent
-            if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
-              echo "[INFO] Installing docker-compose standalone..."
-              COMPOSE_VERSION="v2.28.1"
-              sudo curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+            if ! command -v docker-compose >/dev/null 2>&1; then
+              sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
                 -o /usr/local/bin/docker-compose
               sudo chmod +x /usr/local/bin/docker-compose
             fi
 
-            # 3) Clone initial si besoin
-            if [ ! -d "$APP_DIR/.git" ]; then
-              echo "[INFO] Cloning repo in $APP_DIR..."
-              git clone https://github.com/${GITHUB_REPOSITORY} "$APP_DIR"
-            fi
-
-            # 4) Checkout la même révision que la CI
-            cd "$APP_DIR"
-            git fetch --all --prune
-            git checkout -B main origin/main || git checkout main
-            git reset --hard "$REF"
-
-            # 5) Choix de la commande compose
-            if docker compose version >/dev/null 2>&1; then
-              DC="docker compose"
-            elif docker-compose version >/dev/null 2>&1; then
-              DC="docker-compose"
-            else
-              echo "❌ Docker Compose introuvable."
-              exit 1
-            fi
-
-            # 6) (Optionnel) préparer l'environnement pour GCP si tu utilises Firestore/GCS
-            # Ex : exporte des variables si tu veux (ou tu lis ton .env version cloud)
-            # echo "GCP_PROJECT=ton-projet" > .env.cloud && echo "GCS_BUCKET=steam-raw-data" >> .env.cloud
-
-            # 7) Redémarre la stack
-            $DC pull || true
-            $DC down || true
-            $DC up -d
-
-            # 8) Sanity
-            $DC ps
+            docker-compose down || true
+            docker-compose up -d
