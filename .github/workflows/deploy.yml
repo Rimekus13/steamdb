@@ -8,75 +8,61 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout (CI side)
+      - name: Checkout (for env/sha)
         uses: actions/checkout@v4
 
-      - name: Deploy over SSH
+      - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.SSH_HOST }}         # ex: 35.204.xx.yy
-          username: ${{ secrets.SSH_USER }}     # ex: steamdb_ynov
-          key: ${{ secrets.SSH_KEY }}           # colle la clé privée ENTIEREMENT
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
           port: 22
           script_stop: true
-          # On passe la révision à déployer et l'APP_DIR en variables d'env
-          envs: REF,APP_DIR
-          # CI -> VM
-          # REF = commit courant; APP_DIR = dossier cible sur la VM
-          # (mets la même valeur que ton user GCE)
           script: |
             set -e
 
-            REF="${{ github.sha }}"
-            APP_DIR="${{ secrets.APP_DIR }}"   # ex: /home/steamdb_ynov/steamdb
-            if [ -z "$APP_DIR" ]; then
-              # fallback si pas de secret APP_DIR
-              APP_DIR="/home/${{ secrets.SSH_USER }}/steamdb"
+            # 0) Contexte
+            REF="${GITHUB_SHA}"
+            APP_DIR="${APP_DIR:-$HOME/steamdb}"
+            echo "[INFO] APP_DIR=$APP_DIR"
+            echo "[INFO] REF=$REF"
+
+            # 1) Install Docker si absent
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "[INFO] Installing Docker..."
+              sudo apt-get update -y
+              sudo apt-get install -y docker.io
+              sudo systemctl enable docker
+              sudo systemctl start docker
+              # Ajoute l'utilisateur courant au groupe docker (effet au prochain login)
+              sudo usermod -aG docker "$USER" || true
             fi
 
-            echo "[INFO] Using APP_DIR=$APP_DIR"
-            echo "[INFO] Target REF=${REF:-<empty>} (will fallback to origin/main if empty)"
-
-            # Installer docker-compose standalone si nécessaire
-            if ! command -v docker-compose >/dev/null 2>&1; then
+            # 2) docker-compose (v2 standalone) si absent
+            if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
               echo "[INFO] Installing docker-compose standalone..."
               COMPOSE_VERSION="v2.28.1"
-              sudo curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
+              sudo curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+                -o /usr/local/bin/docker-compose
               sudo chmod +x /usr/local/bin/docker-compose
             fi
 
-            # Installer Docker si besoin (très simple guard)
-            if ! command -v docker >/dev/null 2>&1; then
-              echo "[INFO] Installing Docker..."
-              # Ubuntu (rapide, minimal) :
-              # NB: si ton image est spéciale, adapte au guide Docker officiel.
-              sudo apt-get update -y
-              sudo apt-get install -y docker.io
-              sudo usermod -aG docker $USER || true
-            fi
-
-            # Clone initial si besoin
+            # 3) Clone initial si besoin
             if [ ! -d "$APP_DIR/.git" ]; then
-              echo "[INFO] Cloning repo..."
-              git clone https://github.com/${{ github.repository }} "$APP_DIR"
+              echo "[INFO] Cloning repo in $APP_DIR..."
+              git clone https://github.com/${GITHUB_REPOSITORY} "$APP_DIR"
             fi
 
+            # 4) Checkout la même révision que la CI
             cd "$APP_DIR"
-            git remote set-url origin https://github.com/${{ github.repository }}
             git fetch --all --prune
-
-            # Si REF est vide (cas rare), on prend la pointe de origin/main
-            if [ -z "$REF" ]; then
-              REF="$(git rev-parse origin/main)"
-              echo "[WARN] REF was empty. Fallback to $REF"
-            fi
-
-            echo "[INFO] Checking out main and resetting to $REF"
             git checkout -B main origin/main || git checkout main
             git reset --hard "$REF"
 
-            # Choisir la bonne commande Compose (v2 ou standalone)
+            # 5) Choix de la commande compose
             if docker compose version >/dev/null 2>&1; then
               DC="docker compose"
             elif docker-compose version >/dev/null 2>&1; then
@@ -86,13 +72,14 @@ jobs:
               exit 1
             fi
 
-            # Lancement/Reload de la stack
+            # 6) (Optionnel) préparer l'environnement pour GCP si tu utilises Firestore/GCS
+            # Ex : exporte des variables si tu veux (ou tu lis ton .env version cloud)
+            # echo "GCP_PROJECT=ton-projet" > .env.cloud && echo "GCS_BUCKET=steam-raw-data" >> .env.cloud
+
+            # 7) Redémarre la stack
             $DC pull || true
             $DC down || true
             $DC up -d
 
-            echo "[INFO] Current containers:"
+            # 8) Sanity
             $DC ps
-
-            # Optionnel : vérifier que le DAG est visible
-            # $DC exec -T airflow airflow dags list || true
