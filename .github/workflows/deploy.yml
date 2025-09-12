@@ -9,41 +9,81 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      APP_DIR: /home/steamdb_ynov/steamdb   # dossier cible sur ta VM
+      APP_DIR: /home/steamdb_ynov/steamdb
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Upload repo to VM
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          # fingerprint: ${{ secrets.SSH_FINGERPRINT }}  # décommente si tu l'ajoutes
-          port: 22
-          source: "."
-          target: "${{ env.APP_DIR }}"
-          overwrite: true
-
-      - name: Deploy via SSH (Docker & Compose)
+      # 🔹 Nettoyage dossier cible sur la VM (fixe les erreurs .git/permissions)
+      - name: Prepare target folder (own & clean)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          # fingerprint: ${{ secrets.SSH_FINGERPRINT }}
+          port: 22
+          script_stop: true
+          script: |
+            set -euo pipefail
+            APP_DIR="${APP_DIR:-$HOME/steamdb}"
+            echo "[INFO] Preparing $APP_DIR on $(hostname) as $(whoami)"
+            sudo mkdir -p "$APP_DIR"
+            sudo chown -R "$USER:$USER" "$APP_DIR"
+            # ⚠️ supprime un ancien .git qui aurait des mauvais droits
+            rm -rf "$APP_DIR/.git"
+            # Nettoie tout (garde 'data' si tu en as besoin, sinon enlève la clause -not)
+            find "$APP_DIR" -mindepth 1 -maxdepth 1 -not -name 'data' -exec rm -rf {} +
+
+      # 🔹 Upload sans .git (on whiteliste ce qui sert au déploiement)
+      - name: Upload project to VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          target: "${{ env.APP_DIR }}"
+          overwrite: true
+          source: |
+            docker-compose.yml
+            requirements.txt
+            apps.txt
+            dags
+            etl
+            streamlit
+
+      # 🔹 Déploiement (env + docker compose + trigger Airflow)
+      - name: Deploy and trigger
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
           port: 22
           script_stop: true
           command_timeout: 60m
           script: |
             set -euo pipefail
-            echo "[INFO] Host: $(hostname) User: $(whoami)"
             APP_DIR="${APP_DIR:-$HOME/steamdb}"
             cd "$APP_DIR"
 
-            # 1) Docker
+            # .env pour compose (remplace par tes valeurs/secrets)
+            cat > .env <<'EOF'
+GCP_PROJECT=${{ secrets.GCP_PROJECT }}
+GCS_BUCKET=${{ secrets.GCS_BUCKET }}
+FIRESTORE_PROJECT=${{ secrets.FIRESTORE_PROJECT || secrets.GCP_PROJECT }}
+AIRFLOW_PORT=8081
+STREAMLIT_PORT=8501
+EOF
+
+            # (optionnel) déposer la clé de service
+            if [ -n "${{ secrets.GCP_SA_KEY }}" ]; then
+              echo "${{ secrets.GCP_SA_KEY }}" > gcp-sa.json
+              chmod 600 gcp-sa.json
+            fi
+
+            # Docker / Compose install
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update -y
               sudo apt-get install -y docker.io
@@ -51,24 +91,20 @@ jobs:
               sudo systemctl start docker
               sudo usermod -aG docker "$USER" || true
             fi
-
-            # 2) Compose v2 (fallback standalone)
             if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
               COMPOSE_VERSION="v2.28.1"
               sudo curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
                 -o /usr/local/bin/docker-compose
               sudo chmod +x /usr/local/bin/docker-compose
             fi
+            if docker compose version >/dev/null 2>&1; then DC="docker compose"; else DC="docker-compose"; fi
 
-            # 3) Choix de la commande
-            if docker compose version >/dev/null 2>&1; then
-              DC="docker compose"
-            else
-              DC="docker-compose"
-            fi
-
-            # 4) Déploiement
             $DC pull || true
             $DC down || true
             $DC up -d
             $DC ps
+
+            # Trigger Airflow
+            sleep 10
+            $DC exec -T airflow airflow dags unpause steam_etl_gcp || true
+            $DC exec -T airflow airflow dags trigger steam_etl_gcp
