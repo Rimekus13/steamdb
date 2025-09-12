@@ -18,7 +18,7 @@ services:
       GCP_PROJECT: "${GCP_PROJECT}"
       GCS_BUCKET: "${GCS_BUCKET}"
       FIRESTORE_PROJECT: "${FIRESTORE_PROJECT:-${GCP_PROJECT}}"
-      APP_IDS_FILE: "${APP_IDS_FILE}"
+      APP_IDS_FILE: "${APP_IDS_FILE:-/opt/airflow/apps.txt}"
 
       PYTHONPATH: "/opt/airflow"
 
