@@ -1,0 +1,104 @@
+name: Deploy to VM
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      APP_DIR: /home/${{ secrets.SSH_USER }}/steamdb   # dossier cible sur la VM
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 1) Préparer un dossier propre côté VM (pas de sudo)
+      - name: Prepare target folder on VM
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          script_stop: true
+          envs: APP_DIR
+          script: |
+            set -eu
+            echo "[INFO] Preparing $APP_DIR on $(hostname) as $(whoami)"
+            mkdir -p "$APP_DIR"
+            # nettoie tout le contenu sans supprimer le dossier lui-même
+            find "$APP_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+      # 2) Upload du dépôt vers la VM
+      - name: Upload project to VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          target: ${{ env.APP_DIR }}
+          overwrite: true
+          source: "."   # envoie tout le repo tel quel
+
+      # 3) Nettoyage côté VM (retire .git, crée .env) puis docker compose
+      - name: Deploy (env + docker compose up)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          script_stop: true
+          command_timeout: 60m
+          envs: APP_DIR
+          script: |
+            set -eu
+            cd "$APP_DIR"
+
+            # retire le .git pour éviter les anciens droits et les tar errors
+            rm -rf .git || true
+
+            # génère le .env pour docker-compose (ajuste si besoin)
+            {
+              echo "GCP_PROJECT=${{ secrets.GCP_PROJECT }}"
+              echo "GCS_BUCKET=${{ secrets.GCS_BUCKET }}"
+              echo "FIRESTORE_PROJECT=${{ secrets.FIRESTORE_PROJECT || secrets.GCP_PROJECT }}"
+              echo "AIRFLOW_PORT=8081"
+              echo "STREAMLIT_PORT=8501"
+            } > .env
+
+            # choisir la bonne commande compose
+            if docker compose version >/dev/null 2>&1; then
+              DC="docker compose"
+            elif command -v docker-compose >/dev/null 2>&1; then
+              DC="docker-compose"
+            else
+              echo "[ERROR] docker compose not installed"; exit 1
+            fi
+
+            # build & run
+            $DC pull || true
+            $DC down || true
+            $DC up -d --build
+            $DC ps
+
+      # 4) (Optionnel) Sanity check Airflow
+      - name: Airflow health check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          script_stop: true
+          envs: APP_DIR
+          script: |
+            set -eu
+            cd "$APP_DIR"
+            if docker compose ps | grep -q airflow; then
+              docker compose exec -T airflow bash -lc 'curl -sf http://localhost:${AIRFLOW_PORT:-8081}/health || true'
+            fi
