@@ -50,4 +50,5 @@ services:
         airflow db init;
         (airflow users create --username ${AIRFLOW_USER:-admin} --password ${AIRFLOW_PWD:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com) || true;
         airflow scheduler & exec airflow webserver
-      '
+      ' 
+      
