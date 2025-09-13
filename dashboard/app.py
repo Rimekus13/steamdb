@@ -1,13 +1,18 @@
-# app.py — Firestore + Auth (streamlit-authenticator, admin/admin sans Hasher)
+# app.py — Firestore + Auth robuste (streamlit-authenticator) + UI Steam Reviews
 import os
 import re
 from datetime import datetime, date, timedelta
 import numpy as np
 import pandas as pd
 
+# -------------------------------------------------
+# Mode test (évite d'exécuter la partie UI/DB sous pytest)
+# -------------------------------------------------
 IS_TEST = bool(os.getenv("PYTEST_CURRENT_TEST"))
 
-# ---------------- Config tolérante ----------------
+# -------------------------------------------------
+# Imports "tolérants" (ne doivent pas casser les tests)
+# -------------------------------------------------
 try:
     from config import APP_TITLE, LAYOUT, BASE_CSS
 except Exception:
@@ -25,10 +30,13 @@ except Exception:
     def get_vader(): return None
     def compute_sentiment(*args, **kwargs): return 0.0
 
-# ---------------- Firestore helpers ----------------
+# -------------------------------------------------
+# 🔗 Firestore client + helpers
+# -------------------------------------------------
 PROJECT = os.getenv("FIRESTORE_PROJECT") or os.getenv("GCP_PROJECT")
 
 def fs_get_db():
+    """Client Firestore via ADC (VM GCE / Workload Identity)."""
     if not PROJECT:
         raise RuntimeError(
             "Projet Firestore inconnu. Définis FIRESTORE_PROJECT ou GCP_PROJECT "
@@ -38,11 +46,19 @@ def fs_get_db():
     return firestore.Client(project=PROJECT)
 
 def fs_list_app_ids(db, limit_scan: int = 5000):
+    """
+    Détecte les app_ids via les documents top-level de la collection 'reviews_clean'.
+    Schéma Silver: reviews_clean/{app_id}/items/{doc}
+    """
     cols = db.collection("reviews_clean").list_documents(page_size=limit_scan)
     app_ids = sorted([doc_ref.id for doc_ref in cols if doc_ref.id and doc_ref.id.isdigit()])
     return app_ids
 
 def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
+    """
+    Lit la sous-collection 'items' sous reviews_clean/{app_id}.
+    Normalise les colonnes vers les attentes de l’UI existante.
+    """
     items_col = db.collection("reviews_clean").document(str(app_id)).collection("items")
     docs = items_col.limit(limit).stream()
     rows = [d.to_dict() for d in docs]
@@ -55,25 +71,31 @@ def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
         ])
 
     df = df.copy()
+
+    # app_id
     if "app_id" not in df.columns:
         df["app_id"] = str(app_id)
     else:
         df["app_id"] = df["app_id"].astype(str)
 
+    # texte nettoyé -> review_text
     if "cleaned_review" in df.columns:
         df["review_text"] = df["cleaned_review"].fillna("").astype(str)
     else:
         base_txt = "review_text" if "review_text" in df.columns else ("text" if "text" in df.columns else "review")
         df["review_text"] = df.get(base_txt, "").fillna("").astype(str)
 
+    # langue
     if "language" not in df.columns:
         df["language"] = "unknown"
     else:
         df["language"] = df["language"].fillna("unknown").astype(str)
 
+    # voted_up
     if "voted_up" not in df.columns:
         df["voted_up"] = pd.NA
 
+    # timestamps -> review_date
     if "review_date" in df.columns:
         df["review_date"] = pd.to_datetime(df["review_date"], errors="coerce")
     elif "timestamp_created" in df.columns:
@@ -81,11 +103,13 @@ def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
     else:
         df["review_date"] = pd.NaT
 
+    # sentiment
     if "compound" in df.columns:
         df["compound"] = pd.to_numeric(df["compound"], errors="coerce").fillna(0.0)
     else:
         df["compound"] = 0.0
 
+    # playtime_hours
     if "playtime_hours" in df.columns:
         df["playtime_hours"] = pd.to_numeric(df["playtime_hours"], errors="coerce")
     else:
@@ -109,7 +133,9 @@ def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
 def fs_get_game_name(app_id: str) -> str:
     return str(app_id)
 
-# ---------------- Filters util (tests) ----------------
+# -------------------------------------------------
+# ⚙️ Fonction utilitaire utilisée par les tests (indépendante de Streamlit)
+# -------------------------------------------------
 def apply_filters(
     df: pd.DataFrame,
     languages=None,
@@ -117,7 +143,11 @@ def apply_filters(
     sentiment_range=None,
     search_terms=None
 ) -> pd.DataFrame:
+    """
+    Version minimaliste, indépendante de Streamlit/config, utilisée par les tests.
+    """
     out = df.copy()
+
     if "timestamp" in out.columns:
         out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
     elif "review_date" in out.columns:
@@ -144,9 +174,12 @@ def apply_filters(
                 if isinstance(term, str) and term:
                     mask |= out[base_text].fillna("").str.contains(term, case=False, regex=True)
             out = out[mask]
+
     return out
 
-# ---------------- Streamlit UI ----------------
+# -------------------------------------------------
+# ❌ Tout ce qui suit (UI Streamlit) NE DOIT PAS s'exécuter sous pytest
+# -------------------------------------------------
 if not IS_TEST:
     import json
     import streamlit as st
@@ -154,14 +187,14 @@ if not IS_TEST:
     from dotenv import load_dotenv
     load_dotenv()
 
-    # ---------- AUTH sans Hasher ----------
+    # ---------------------------------------------
+    # AUTH robuste multi-versions (sans Hasher)
+    # ---------------------------------------------
     AUTH_ON = (os.getenv("STREAMLIT_AUTH", "ON").upper() in ("1", "TRUE", "ON", "YES"))
 
     if AUTH_ON:
-        # 1) Si AUTH_USERS_JSON fourni (liste d'utilisateurs avec password déjà hashé), on l'utilise.
-        #    Sinon, on met un utilisateur par défaut: admin/admin (hashé ci-dessous).
-        credentials = None
         users_env = os.getenv("AUTH_USERS_JSON", "").strip()
+        credentials = None
         if users_env:
             try:
                 users = json.loads(users_env)
@@ -175,18 +208,10 @@ if not IS_TEST:
             except Exception:
                 credentials = None
 
+        # Fallback: admin/admin (bcrypt déjà hashé)
         if not credentials:
-            # Hash bcrypt du mot de passe "admin"
-            # (Tu peux en générer un autre si tu veux)
             ADMIN_BCRYPT = "$2b$12$KIXQ4Q.ZX7o9qpiapqYPOuNsq4CPGK/c/pXHiY/VKwxLBzME2Y8a2"
-            credentials = {
-                "usernames": {
-                    "admin": {
-                        "name": "Admin",
-                        "password": ADMIN_BCRYPT
-                    }
-                }
-            }
+            credentials = {"usernames": {"admin": {"name": "Admin", "password": ADMIN_BCRYPT}}}
 
         cookie_name = os.getenv("AUTH_COOKIE_NAME", "steamdb_auth")
         cookie_key  = os.getenv("AUTH_COOKIE_KEY",  "change-me")
@@ -199,12 +224,31 @@ if not IS_TEST:
             cookie_expiry_days=cookie_days,
         )
 
-        # Utilise la signature (label, location) en positionnel pour matcher toutes versions
-        login_out = authenticator.login("Connexion", "main")
+        # Wrapper de login multi-signatures (selon la version installée)
+        def do_login():
+            attempts = [
+                lambda: authenticator.login("main", "Connexion"),           # (location, form_name)  ← versions récentes
+                lambda: authenticator.login("Connexion", "main"),           # (form_name, location)
+                lambda: authenticator.login(location="main"),               # (kw-only)
+                lambda: authenticator.login("Connexion"),                   # (form_name)
+                lambda: authenticator.login("main"),                        # (location)
+                lambda: authenticator.login("Connexion", location="main"),  # mix
+            ]
+            for call in attempts:
+                try:
+                    return call()
+                except Exception:
+                    continue
+            # Dernier essai (la plus probable) pour exposer l'erreur si tout échoue
+            return authenticator.login("main", "Connexion")
+
+        login_out = do_login()
         if isinstance(login_out, tuple) and len(login_out) == 3:
             name, auth_status, username = login_out
         else:
-            name, auth_status, username = None, None, None
+            name = getattr(login_out, "name", None) if login_out else None
+            auth_status = getattr(login_out, "authentication_status", None) if login_out else None
+            username = getattr(login_out, "username", None) if login_out else None
 
         if auth_status is False:
             st.error("Identifiants invalides.")
@@ -214,16 +258,25 @@ if not IS_TEST:
             st.stop()
 
         st.sidebar.write(f"🔒 Connecté en tant que **{name or 'utilisateur'}**")
-        if st.sidebar.button("Se déconnecter"):
+        # Déconnexion (compat multi-versions)
+        try:
             authenticator.logout("Déconnexion", "sidebar")
-            st.stop()
+        except Exception:
+            try:
+                authenticator.logout(location="sidebar")
+            except Exception:
+                pass
 
-    # ---------- Page config & CSS ----------
+    # ---------------------------------------------
+    # Page config & CSS
+    # ---------------------------------------------
     st.set_page_config(page_title=APP_TITLE, layout=LAYOUT)
     if BASE_CSS:
         st.markdown(BASE_CSS, unsafe_allow_html=True)
 
-    # ---------- DB & discovery ----------
+    # ---------------------------------------------
+    # DB & discovery (Firestore)
+    # ---------------------------------------------
     try:
         db = fs_get_db()
     except Exception as e:
@@ -245,7 +298,9 @@ if not IS_TEST:
     st.markdown(f"### {names.get(selected_app, selected_app)}")
     st.image(f"https://cdn.akamai.steamstatic.com/steam/apps/{selected_app}/header.jpg", use_container_width=True)
 
-    # ---------- Load Silver ----------
+    # ---------------------------------------------
+    # Loading (Silver depuis Firestore)
+    # ---------------------------------------------
     try:
         df = fs_fetch_clean_df(db, selected_app)
     except Exception as e:
@@ -256,7 +311,9 @@ if not IS_TEST:
         st.warning("Aucune donnée disponible pour ce jeu.")
         st.stop()
 
-    # ---------- Sentiment ----------
+    # ---------------------------------------------
+    # Sentiment numeric + label
+    # ---------------------------------------------
     if "compound" in df.columns:
         df["sentiment"] = pd.to_numeric(df["compound"], errors="coerce").fillna(0.0)
     else:
@@ -272,7 +329,9 @@ if not IS_TEST:
             return "neutre"
     df["sentiment_label"] = df["sentiment"].apply(senti_label)
 
-    # ---------- Play profiles ----------
+    # ---------------------------------------------
+    # Play profiles
+    # ---------------------------------------------
     def play_profile(h):
         try:
             if pd.isna(h): return "Inconnu"
@@ -287,7 +346,9 @@ if not IS_TEST:
     df["playtime_hours"] = pd.to_numeric(df.get("playtime_hours", np.nan), errors="coerce")
     df["play_profile"] = df["playtime_hours"].apply(play_profile)
 
-    # ---------- Dates par défaut ----------
+    # ---------------------------------------------
+    # Default dates
+    # ---------------------------------------------
     if df["review_date"].notna().any():
         global_min = pd.to_datetime(df["review_date"], errors="coerce").dropna().min().date()
         global_max = pd.to_datetime(df["review_date"], errors="coerce").dropna().max().date()
@@ -305,16 +366,29 @@ if not IS_TEST:
     if st.session_state.date_min > st.session_state.date_max:
         st.session_state.date_min, st.session_state.date_max = st.session_state.date_max, st.session_state.date_min
 
-    # ---------- Filtres sidebar ----------
+    # ---------------------------------------------
+    # Sidebar filters
+    # ---------------------------------------------
     def render_filters_sidebar(df, global_min, global_max):
         sb = st.sidebar
         sb.header("🧭 Filtres")
 
+        # 🎯 Essentiels
         sb.subheader("🎯 Essentiels")
-        dmin = sb.date_input("📅 Depuis", value=st.session_state.date_min,
-                             min_value=global_min, max_value=global_max, key="f_date_min")
-        dmax = sb.date_input("📅 Jusqu’à", value=st.session_state.date_max,
-                             min_value=global_min, max_value=global_max, key="f_date_max")
+        dmin = sb.date_input(
+            "📅 Depuis",
+            value=st.session_state.date_min,
+            min_value=global_min,
+            max_value=global_max,
+            key="f_date_min"
+        )
+        dmax = sb.date_input(
+            "📅 Jusqu’à",
+            value=st.session_state.date_max,
+            min_value=global_min,
+            max_value=global_max,
+            key="f_date_max"
+        )
         col_q1, col_q2, col_q3 = sb.columns(3)
         if col_q1.button("7 j", key="f_q7"):
             st.session_state.date_min = max(global_min, global_max - timedelta(days=6)); st.session_state.date_max = global_max; st.rerun()
@@ -323,11 +397,19 @@ if not IS_TEST:
         if col_q3.button("90 j", key="f_q90"):
             st.session_state.date_min = max(global_min, global_max - timedelta(days=89)); st.session_state.date_max = global_max; st.rerun()
 
+        # 🌐 Langues (simple — tu pourras brancher un mapping complet plus tard)
         langs = sorted(df["language"].dropna().unique().tolist()) or ["unknown"]
-        chosen_langs = sb.multiselect("🌐 Langues", options=langs, default=langs, key="f_langs")
+        # "Toutes les langues" par défaut : on coche tout
+        default_langs = langs
+        chosen_langs = sb.multiselect("🌐 Langues", options=langs, default=default_langs, key="f_langs")
+        # Bouton pratique pour tout sélectionner
+        if sb.button("Tout sélectionner", key="f_langs_all"):
+            st.session_state.f_langs = langs
+            st.rerun()
 
         sb.divider()
 
+        # ⏱️ Heures de jeu
         sb.subheader("⏱️ Heures de jeu")
         play_mode = sb.radio("Mode", ["Profils prédéfinis", "Plage d'heures"], key="f_play_mode", horizontal=True)
 
@@ -349,7 +431,7 @@ if not IS_TEST:
                 if hmax_raw <= hmin:
                     hmax_raw = hmin + 1
             else:
-                hmin, hmax_raw = 0, 1
+                hmin, hmax_raw = 0, 1  # évite slider min==max
             hmax = max(hmin + 1, int(np.ceil(hmax_raw / 10) * 10) if hmax_raw > 0 else 10)
             default_low = hmin
             default_high = hmax_raw if hmax_raw > hmin else hmax
@@ -363,18 +445,23 @@ if not IS_TEST:
 
         sb.divider()
 
+        # 🙂 Sentiment
         sb.subheader("🙂 Sentiment")
-        senti_choice = sb.radio("", options=["Tous", "Positifs", "Neutres", "Négatifs"],
-                                index=0, key="f_senti", horizontal=True)
+        senti_choice = sb.radio(
+            "", options=["Tous", "Positifs", "Neutres", "Négatifs"],
+            index=0, key="f_senti", horizontal=True
+        )
 
         sb.divider()
 
+        # 🔎 Mots-clés
         sb.subheader("🔎 Mots-clés")
         keywords_raw = sb.text_input("Ex: bug, crash", key="f_keywords")
         match_all = sb.checkbox("ET logique (tous les mots)", value=False, key="f_keywords_all")
 
         sb.divider()
 
+        # ⚙️ Actions
         sb.subheader("⚙️ Actions")
         hard_refresh = sb.checkbox("🧹 Purger le cache avant calcul", value=False, key="f_hard_refresh")
         col_a, col_b = sb.columns(2)
@@ -416,7 +503,7 @@ if not IS_TEST:
 
     flt = render_filters_sidebar(df, global_min, global_max)
 
-    # ---------- Apply filters ----------
+    # Apply filters (UI)
     mask = pd.Series(True, index=df.index)
 
     if flt["chosen_langs"]:
@@ -432,6 +519,7 @@ if not IS_TEST:
     elif flt["senti_choice"] == "Négatifs":
         mask &= df["sentiment"] < -0.05
 
+    # Playtime filter
     if flt["play_mode"] == "Profils prédéfinis":
         if flt["chosen_profiles"]:
             mask &= df["play_profile"].isin(flt["chosen_profiles"])
@@ -444,6 +532,7 @@ if not IS_TEST:
 
     df_f = df[mask].copy()
 
+    # Filtre mots-clés
     kw = flt["keywords_raw"]
     if kw and kw.strip() and not df_f.empty:
         kws = [k.strip().lower() for k in kw.split(",") if k.strip()]
@@ -455,6 +544,7 @@ if not IS_TEST:
                 pattern = r"\b(" + "|".join([re.escape(k) for k in kws]) + r")\b"
             df_f = df_f[df_f["review_text"].astype(str).str.contains(pattern, regex=True, na=False)]
 
+    # Caption
     if flt["play_mode"] == "Profils prédéfinis":
         play_txt = f"Profils: {', '.join(flt['chosen_profiles']) if flt['chosen_profiles'] else '—'}"
     else:
@@ -469,7 +559,9 @@ if not IS_TEST:
         f"Avis filtrés : **{len(df_f):,}** • Projet Firestore: **{PROJECT}**"
     )
 
-    # ---------- KPIs ----------
+    # ---------------------------------------------
+    # KPIs + context
+    # ---------------------------------------------
     pos = (df_f["sentiment"] > 0.05).mean() * 100 if len(df_f) else 0.0
     neu = ((df_f["sentiment"] >= -0.05) & (df_f["sentiment"] <= 0.05)).mean() * 100 if len(df_f) else 0.0
     neg = (df_f["sentiment"] < -0.05).mean() * 100 if len(df_f) else 0.0
@@ -489,7 +581,7 @@ if not IS_TEST:
         rows.append((th, freq))
     freq_df = pd.DataFrame(rows, columns=["Thème","Fréquence (%)"]).sort_values("Fréquence (%)", ascending=False)
 
-    # ---------- Tabs ----------
+    # Tabs
     from tabs import (
         synthese, sentiment as t_sentiment, themes, langues, playtime,
         longueur, cooccurrences, anomalies, qualite,
