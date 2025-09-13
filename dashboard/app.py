@@ -1,6 +1,8 @@
-# app.py — Firestore + Auth (streamlit-authenticator)
+# app.py — Firestore + Auth (version compat)
 import os
 import re
+import json
+import inspect
 from datetime import datetime, date, timedelta
 import numpy as np
 import pandas as pd
@@ -194,13 +196,12 @@ def apply_filters(
 # ❌ Tout ce qui suit (UI Streamlit) NE DOIT PAS s'exécuter sous pytest
 # -------------------------------------------------
 if not IS_TEST:
-    import json
     import streamlit as st
     import streamlit_authenticator as stauth
     from dotenv import load_dotenv
     load_dotenv()
 
-    # ------------- AUTH -------------
+    # ------------- AUTH (compatible toutes versions) -------------
     AUTH_ON = (os.getenv("STREAMLIT_AUTH", "ON").upper() in ("1", "TRUE", "ON", "YES"))
     if AUTH_ON:
         users_raw = os.getenv("AUTH_USERS_JSON", "[]")
@@ -209,14 +210,30 @@ if not IS_TEST:
         except Exception:
             users = []
 
+        # Fallback si rien en ENV : user admin/admin
         if not users:
-            # Fallback d'urgence : à remplacer par ton JSON côté .env
             users = [{
                 "name": "Admin",
                 "username": "admin",
-                "password": "$2b$12$ThisIsAnInvalidHashChangeMe"
+                "plain_password": "admin"   # sera hashé automatiquement ci-dessous
             }]
 
+        # Si plain_password est fourni, on le hashe en runtime
+        # (utile pour éviter de stocker un hash en clair dans les secrets)
+        try:
+            # Hasher attend une liste de mots de passe
+            to_hash = [u["plain_password"] for u in users if "plain_password" in u and "password" not in u]
+            if to_hash:
+                hashed = stauth.Hasher(to_hash).generate()
+                idx = 0
+                for u in users:
+                    if "plain_password" in u and "password" not in u:
+                        u["password"] = hashed[idx]
+                        idx += 1
+        except Exception:
+            pass
+
+        # Construire le dict credentials attendu par la lib
         credentials = {
             "usernames": {
                 u["username"]: {"name": u["name"], "password": u["password"]}
@@ -235,10 +252,16 @@ if not IS_TEST:
             cookie_expiry_days=cookie_days,
         )
 
-        name, auth_status, username = authenticator.login(
-           form_name="Connexion",
-           location="main",   # valeurs possibles: "main", "sidebar", "unrendered"
-        )
+        # Appel login compatible anciennes & nouvelles versions
+        login_sig = inspect.signature(authenticator.login)
+        if "form_name" in login_sig.parameters:
+            name, auth_status, username = authenticator.login(
+                form_name="Connexion",
+                location="main"
+            )
+        else:
+            name, auth_status, username = authenticator.login("Connexion", "main")
+
         if auth_status is False:
             st.error("Identifiants invalides.")
             st.stop()
@@ -247,9 +270,8 @@ if not IS_TEST:
             st.stop()
 
         st.sidebar.write(f"🔒 Connecté en tant que **{name}**")
-        if st.sidebar.button("Se déconnecter"):
-            authenticator.logout("Déconnexion", "sidebar")
-            st.stop()
+        # Logout (API stable)
+        authenticator.logout("Déconnexion", "sidebar")
 
     # ---------------------------------------------
     # Page config & CSS
@@ -575,4 +597,3 @@ if not IS_TEST:
     with tabs[8]: qualite.render(st, ctx)
     with tabs[9]: explorateur.render(st, ctx)
     with tabs[10]: updates.render(st, ctx)
-#
