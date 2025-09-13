@@ -20,3 +20,6 @@ seaborn>=0.13
 plotly
 seaborn
 wordcloud
+
+streamlit-authenticator>=0.3
+passlib[bcrypt]
