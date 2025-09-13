@@ -519,3 +519,4 @@ if not IS_TEST:
     with tabs[8]: qualite.render(st, ctx)
     with tabs[9]: explorateur.render(st, ctx)
     with tabs[10]: updates.render(st, ctx)
+#
