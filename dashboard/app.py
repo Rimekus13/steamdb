@@ -1,18 +1,13 @@
-# app.py — Firestore + Auth (streamlit-authenticator, admin/admin)
+# app.py — Firestore + Auth (streamlit-authenticator, admin/admin sans Hasher)
 import os
 import re
 from datetime import datetime, date, timedelta
 import numpy as np
 import pandas as pd
 
-# -------------------------------------------------
-# Mode test (évite d'exécuter la partie UI/DB sous pytest)
-# -------------------------------------------------
 IS_TEST = bool(os.getenv("PYTEST_CURRENT_TEST"))
 
-# -------------------------------------------------
-# Imports "tolérants"
-# -------------------------------------------------
+# ---------------- Config tolérante ----------------
 try:
     from config import APP_TITLE, LAYOUT, BASE_CSS
 except Exception:
@@ -30,13 +25,10 @@ except Exception:
     def get_vader(): return None
     def compute_sentiment(*args, **kwargs): return 0.0
 
-# -------------------------------------------------
-# 🔗 Firestore client + helpers
-# -------------------------------------------------
+# ---------------- Firestore helpers ----------------
 PROJECT = os.getenv("FIRESTORE_PROJECT") or os.getenv("GCP_PROJECT")
 
 def fs_get_db():
-    """Client Firestore via ADC (VM GCE / Workload Identity)."""
     if not PROJECT:
         raise RuntimeError(
             "Projet Firestore inconnu. Définis FIRESTORE_PROJECT ou GCP_PROJECT "
@@ -46,13 +38,11 @@ def fs_get_db():
     return firestore.Client(project=PROJECT)
 
 def fs_list_app_ids(db, limit_scan: int = 5000):
-    """Schéma Silver: reviews_clean/{app_id}/items/{doc}"""
     cols = db.collection("reviews_clean").list_documents(page_size=limit_scan)
     app_ids = sorted([doc_ref.id for doc_ref in cols if doc_ref.id and doc_ref.id.isdigit()])
     return app_ids
 
 def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
-    """Lit reviews_clean/{app_id}/items et normalise les colonnes attendues."""
     items_col = db.collection("reviews_clean").document(str(app_id)).collection("items")
     docs = items_col.limit(limit).stream()
     rows = [d.to_dict() for d in docs]
@@ -65,30 +55,25 @@ def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
         ])
 
     df = df.copy()
-    # app_id
     if "app_id" not in df.columns:
         df["app_id"] = str(app_id)
     else:
         df["app_id"] = df["app_id"].astype(str)
 
-    # texte nettoyé -> review_text
     if "cleaned_review" in df.columns:
         df["review_text"] = df["cleaned_review"].fillna("").astype(str)
     else:
         base_txt = "review_text" if "review_text" in df.columns else ("text" if "text" in df.columns else "review")
         df["review_text"] = df.get(base_txt, "").fillna("").astype(str)
 
-    # langue
     if "language" not in df.columns:
         df["language"] = "unknown"
     else:
         df["language"] = df["language"].fillna("unknown").astype(str)
 
-    # voted_up
     if "voted_up" not in df.columns:
         df["voted_up"] = pd.NA
 
-    # timestamps -> review_date
     if "review_date" in df.columns:
         df["review_date"] = pd.to_datetime(df["review_date"], errors="coerce")
     elif "timestamp_created" in df.columns:
@@ -96,13 +81,11 @@ def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
     else:
         df["review_date"] = pd.NaT
 
-    # sentiment
     if "compound" in df.columns:
         df["compound"] = pd.to_numeric(df["compound"], errors="coerce").fillna(0.0)
     else:
         df["compound"] = 0.0
 
-    # playtime_hours
     if "playtime_hours" in df.columns:
         df["playtime_hours"] = pd.to_numeric(df["playtime_hours"], errors="coerce")
     else:
@@ -126,9 +109,7 @@ def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
 def fs_get_game_name(app_id: str) -> str:
     return str(app_id)
 
-# -------------------------------------------------
-# ⚙️ Fonction utilitaire (tests)
-# -------------------------------------------------
+# ---------------- Filters util (tests) ----------------
 def apply_filters(
     df: pd.DataFrame,
     languages=None,
@@ -137,7 +118,6 @@ def apply_filters(
     search_terms=None
 ) -> pd.DataFrame:
     out = df.copy()
-
     if "timestamp" in out.columns:
         out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
     elif "review_date" in out.columns:
@@ -164,12 +144,9 @@ def apply_filters(
                 if isinstance(term, str) and term:
                     mask |= out[base_text].fillna("").str.contains(term, case=False, regex=True)
             out = out[mask]
-
     return out
 
-# -------------------------------------------------
-# UI Streamlit (pas en mode test)
-# -------------------------------------------------
+# ---------------- Streamlit UI ----------------
 if not IS_TEST:
     import json
     import streamlit as st
@@ -177,43 +154,39 @@ if not IS_TEST:
     from dotenv import load_dotenv
     load_dotenv()
 
-    # ------------- AUTH -------------
+    # ---------- AUTH sans Hasher ----------
     AUTH_ON = (os.getenv("STREAMLIT_AUTH", "ON").upper() in ("1", "TRUE", "ON", "YES"))
 
     if AUTH_ON:
-        # 1) Générer un hash pour le mot de passe "admin" (ou prendre depuis AUTH_USERS_JSON si fourni)
-        DEFAULT_USER = os.getenv("AUTH_DEFAULT_USER", "admin")
-        DEFAULT_NAME = os.getenv("AUTH_DEFAULT_NAME", "Admin")
-        default_pwd = os.getenv("AUTH_DEFAULT_PASSWORD", "admin")
-
-        # Hasher correctement (API récente: Hasher().generate([...]))
-        try:
-            default_hash = stauth.Hasher().generate([default_pwd])[0]
-        except Exception:
-            # fallback si API différente
-            default_hash = stauth.Hasher([default_pwd]).generate()[0]
-
+        # 1) Si AUTH_USERS_JSON fourni (liste d'utilisateurs avec password déjà hashé), on l'utilise.
+        #    Sinon, on met un utilisateur par défaut: admin/admin (hashé ci-dessous).
+        credentials = None
         users_env = os.getenv("AUTH_USERS_JSON", "").strip()
-        users = []
         if users_env:
             try:
                 users = json.loads(users_env)
+                credentials = {
+                    "usernames": {
+                        u["username"]: {"name": u["name"], "password": u["password"]}
+                        for u in users
+                        if all(k in u for k in ("username", "name", "password"))
+                    }
+                }
             except Exception:
-                users = []
+                credentials = None
 
-        if not users:
-            users = [{
-                "name": DEFAULT_NAME,
-                "username": DEFAULT_USER,
-                "password": default_hash
-            }]
-
-        credentials = {
-            "usernames": {
-                u["username"]: {"name": u["name"], "password": u["password"]}
-                for u in users if all(k in u for k in ("username", "name", "password"))
+        if not credentials:
+            # Hash bcrypt du mot de passe "admin"
+            # (Tu peux en générer un autre si tu veux)
+            ADMIN_BCRYPT = "$2b$12$KIXQ4Q.ZX7o9qpiapqYPOuNsq4CPGK/c/pXHiY/VKwxLBzME2Y8a2"
+            credentials = {
+                "usernames": {
+                    "admin": {
+                        "name": "Admin",
+                        "password": ADMIN_BCRYPT
+                    }
+                }
             }
-        }
 
         cookie_name = os.getenv("AUTH_COOKIE_NAME", "steamdb_auth")
         cookie_key  = os.getenv("AUTH_COOKIE_KEY",  "change-me")
@@ -226,8 +199,8 @@ if not IS_TEST:
             cookie_expiry_days=cookie_days,
         )
 
-        # La méthode login peut retourner None selon versions => gérer prudemment
-        login_out = authenticator.login(location="main")
+        # Utilise la signature (label, location) en positionnel pour matcher toutes versions
+        login_out = authenticator.login("Connexion", "main")
         if isinstance(login_out, tuple) and len(login_out) == 3:
             name, auth_status, username = login_out
         else:
@@ -245,16 +218,12 @@ if not IS_TEST:
             authenticator.logout("Déconnexion", "sidebar")
             st.stop()
 
-    # ---------------------------------------------
-    # Page config & CSS
-    # ---------------------------------------------
+    # ---------- Page config & CSS ----------
     st.set_page_config(page_title=APP_TITLE, layout=LAYOUT)
     if BASE_CSS:
         st.markdown(BASE_CSS, unsafe_allow_html=True)
 
-    # ---------------------------------------------
-    # DB & discovery (Firestore)
-    # ---------------------------------------------
+    # ---------- DB & discovery ----------
     try:
         db = fs_get_db()
     except Exception as e:
@@ -276,9 +245,7 @@ if not IS_TEST:
     st.markdown(f"### {names.get(selected_app, selected_app)}")
     st.image(f"https://cdn.akamai.steamstatic.com/steam/apps/{selected_app}/header.jpg", use_container_width=True)
 
-    # ---------------------------------------------
-    # Loading (Silver depuis Firestore)
-    # ---------------------------------------------
+    # ---------- Load Silver ----------
     try:
         df = fs_fetch_clean_df(db, selected_app)
     except Exception as e:
@@ -286,11 +253,10 @@ if not IS_TEST:
         st.stop()
 
     if df.empty:
-        st.warning("Aucune donnée disponible pour ce jeu."); st.stop()
+        st.warning("Aucune donnée disponible pour ce jeu.")
+        st.stop()
 
-    # ---------------------------------------------
-    # Sentiment numeric + label
-    # ---------------------------------------------
+    # ---------- Sentiment ----------
     if "compound" in df.columns:
         df["sentiment"] = pd.to_numeric(df["compound"], errors="coerce").fillna(0.0)
     else:
@@ -306,9 +272,7 @@ if not IS_TEST:
             return "neutre"
     df["sentiment_label"] = df["sentiment"].apply(senti_label)
 
-    # ---------------------------------------------
-    # Play profiles
-    # ---------------------------------------------
+    # ---------- Play profiles ----------
     def play_profile(h):
         try:
             if pd.isna(h): return "Inconnu"
@@ -323,9 +287,7 @@ if not IS_TEST:
     df["playtime_hours"] = pd.to_numeric(df.get("playtime_hours", np.nan), errors="coerce")
     df["play_profile"] = df["playtime_hours"].apply(play_profile)
 
-    # ---------------------------------------------
-    # Default dates
-    # ---------------------------------------------
+    # ---------- Dates par défaut ----------
     if df["review_date"].notna().any():
         global_min = pd.to_datetime(df["review_date"], errors="coerce").dropna().min().date()
         global_max = pd.to_datetime(df["review_date"], errors="coerce").dropna().max().date()
@@ -343,14 +305,11 @@ if not IS_TEST:
     if st.session_state.date_min > st.session_state.date_max:
         st.session_state.date_min, st.session_state.date_max = st.session_state.date_max, st.session_state.date_min
 
-    # ---------------------------------------------
-    # Sidebar filters
-    # ---------------------------------------------
+    # ---------- Filtres sidebar ----------
     def render_filters_sidebar(df, global_min, global_max):
         sb = st.sidebar
         sb.header("🧭 Filtres")
 
-        # 🎯 Essentiels
         sb.subheader("🎯 Essentiels")
         dmin = sb.date_input("📅 Depuis", value=st.session_state.date_min,
                              min_value=global_min, max_value=global_max, key="f_date_min")
@@ -364,13 +323,11 @@ if not IS_TEST:
         if col_q3.button("90 j", key="f_q90"):
             st.session_state.date_min = max(global_min, global_max - timedelta(days=89)); st.session_state.date_max = global_max; st.rerun()
 
-        # Langues (simple pour l’instant — mapping complet possible plus tard)
         langs = sorted(df["language"].dropna().unique().tolist()) or ["unknown"]
         chosen_langs = sb.multiselect("🌐 Langues", options=langs, default=langs, key="f_langs")
 
         sb.divider()
 
-        # ⏱️ Heures de jeu
         sb.subheader("⏱️ Heures de jeu")
         play_mode = sb.radio("Mode", ["Profils prédéfinis", "Plage d'heures"], key="f_play_mode", horizontal=True)
 
@@ -406,21 +363,18 @@ if not IS_TEST:
 
         sb.divider()
 
-        # 🙂 Sentiment
         sb.subheader("🙂 Sentiment")
         senti_choice = sb.radio("", options=["Tous", "Positifs", "Neutres", "Négatifs"],
                                 index=0, key="f_senti", horizontal=True)
 
         sb.divider()
 
-        # 🔎 Mots-clés
         sb.subheader("🔎 Mots-clés")
         keywords_raw = sb.text_input("Ex: bug, crash", key="f_keywords")
         match_all = sb.checkbox("ET logique (tous les mots)", value=False, key="f_keywords_all")
 
         sb.divider()
 
-        # ⚙️ Actions
         sb.subheader("⚙️ Actions")
         hard_refresh = sb.checkbox("🧹 Purger le cache avant calcul", value=False, key="f_hard_refresh")
         col_a, col_b = sb.columns(2)
@@ -462,7 +416,7 @@ if not IS_TEST:
 
     flt = render_filters_sidebar(df, global_min, global_max)
 
-    # Apply filters (UI)
+    # ---------- Apply filters ----------
     mask = pd.Series(True, index=df.index)
 
     if flt["chosen_langs"]:
@@ -478,7 +432,6 @@ if not IS_TEST:
     elif flt["senti_choice"] == "Négatifs":
         mask &= df["sentiment"] < -0.05
 
-    # Playtime filter
     if flt["play_mode"] == "Profils prédéfinis":
         if flt["chosen_profiles"]:
             mask &= df["play_profile"].isin(flt["chosen_profiles"])
@@ -502,7 +455,6 @@ if not IS_TEST:
                 pattern = r"\b(" + "|".join([re.escape(k) for k in kws]) + r")\b"
             df_f = df_f[df_f["review_text"].astype(str).str.contains(pattern, regex=True, na=False)]
 
-    # Caption
     if flt["play_mode"] == "Profils prédéfinis":
         play_txt = f"Profils: {', '.join(flt['chosen_profiles']) if flt['chosen_profiles'] else '—'}"
     else:
@@ -517,9 +469,7 @@ if not IS_TEST:
         f"Avis filtrés : **{len(df_f):,}** • Projet Firestore: **{PROJECT}**"
     )
 
-    # ---------------------------------------------
-    # KPIs + context
-    # ---------------------------------------------
+    # ---------- KPIs ----------
     pos = (df_f["sentiment"] > 0.05).mean() * 100 if len(df_f) else 0.0
     neu = ((df_f["sentiment"] >= -0.05) & (df_f["sentiment"] <= 0.05)).mean() * 100 if len(df_f) else 0.0
     neg = (df_f["sentiment"] < -0.05).mean() * 100 if len(df_f) else 0.0
@@ -539,7 +489,7 @@ if not IS_TEST:
         rows.append((th, freq))
     freq_df = pd.DataFrame(rows, columns=["Thème","Fréquence (%)"]).sort_values("Fréquence (%)", ascending=False)
 
-    # Tabs
+    # ---------- Tabs ----------
     from tabs import (
         synthese, sentiment as t_sentiment, themes, langues, playtime,
         longueur, cooccurrences, anomalies, qualite,
@@ -569,4 +519,3 @@ if not IS_TEST:
     with tabs[8]: qualite.render(st, ctx)
     with tabs[9]: explorateur.render(st, ctx)
     with tabs[10]: updates.render(st, ctx)
-#
