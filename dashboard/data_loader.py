@@ -129,3 +129,4 @@ def load_df(collection, _db):
             df[col] = pd.NA
 
     return df
+#
