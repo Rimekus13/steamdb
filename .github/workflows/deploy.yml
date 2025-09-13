@@ -16,21 +16,42 @@ jobs:
         uses: actions/checkout@v4
 
       # 1) Préparer un dossier propre côté VM (pas de sudo)
-      - name: Prepare target folder on VM
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: 22
-          script_stop: true
-          envs: APP_DIR
-          script: |
-            set -eu
-            echo "[INFO] Preparing $APP_DIR on $(hostname) as $(whoami)"
-            mkdir -p "$APP_DIR"
-            # nettoie tout le contenu sans supprimer le dossier lui-même
-            find "$APP_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+      - name: Prepare app dir on VM
+      uses: appleboy/ssh-action@v1.0.3
+       with:
+      host: ${{ secrets.SSH_HOST }}
+      username: ${{ secrets.SSH_USER }}
+      key: ${{ secrets.SSH_KEY }}
+      script_stop: true
+      script: |
+      set -euo pipefail
+      APP_DIR="${APP_DIR:-$HOME/steamdb}"
+      echo "[INFO] Preparing $APP_DIR on $(hostname) as $(whoami)"
+      # Assurer que TON user est proprio du dépôt (sauf logs)
+      sudo mkdir -p "$APP_DIR"
+      sudo chown -R "$USER":"$USER" "$APP_DIR"
+
+      # Nettoyer tout sauf 'logs' pour éviter les erreurs de droits et conserver les logs
+      find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name logs -exec rm -rf {} +
+
+      # Recréer l’arbo requise (si besoin)
+      mkdir -p "$APP_DIR/dags" "$APP_DIR/etl" "$APP_DIR/dashboard" "$APP_DIR/.github/workflows"
+
+      # S'assurer que les logs sont ok pour Airflow (UID 50000)
+      sudo mkdir -p "$APP_DIR/logs"
+      sudo chown -R 50000:0 "$APP_DIR/logs"
+      sudo chmod -R g+rwX "$APP_DIR/logs"
+
+      # (Optionnel) si tu veux régénérer le .env ici
+      cat > "$APP_DIR/.env" <<'EOF'
+      GCP_PROJECT=${{ secrets.GCP_PROJECT }}
+      GCS_BUCKET=${{ secrets.GCS_BUCKET }}
+      FIRESTORE_PROJECT=${{ secrets.FIRESTORE_PROJECT }}
+      AIRFLOW_PORT=8081
+      STREAMLIT_PORT=8501
+      APP_IDS_FILE=/opt/airflow/apps.txt
+      EOF
+
 
       # 2) Upload du dépôt vers la VM
       - name: Upload project to VM
