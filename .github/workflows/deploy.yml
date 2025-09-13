@@ -49,11 +49,8 @@ jobs:
           port: 22
           target: ${{ env.APP_DIR }}
           overwrite: true
-          source: |
-            .
-            !logs/**
-            !.git/**
-
+          source: "."
+          
       - name: Deploy (env + docker compose up)
         uses: appleboy/ssh-action@v1.0.3
         with:
