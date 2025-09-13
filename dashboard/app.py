@@ -1,7 +1,6 @@
-# app.py — Firestore + Auth (compat nouvelle/ancienne API) + UI filtres
+# app.py — Firestore + Auth (streamlit-authenticator, admin/admin)
 import os
 import re
-import json
 from datetime import datetime, date, timedelta
 import numpy as np
 import pandas as pd
@@ -37,9 +36,7 @@ except Exception:
 PROJECT = os.getenv("FIRESTORE_PROJECT") or os.getenv("GCP_PROJECT")
 
 def fs_get_db():
-    """
-    Client Firestore via ADC (VM GCE / Workload Identity).
-    """
+    """Client Firestore via ADC (VM GCE / Workload Identity)."""
     if not PROJECT:
         raise RuntimeError(
             "Projet Firestore inconnu. Définis FIRESTORE_PROJECT ou GCP_PROJECT "
@@ -49,17 +46,13 @@ def fs_get_db():
     return firestore.Client(project=PROJECT)
 
 def fs_list_app_ids(db, limit_scan: int = 5000):
-    """
-    Schéma Silver: reviews_clean/{app_id}/items/{doc}
-    """
+    """Schéma Silver: reviews_clean/{app_id}/items/{doc}"""
     cols = db.collection("reviews_clean").list_documents(page_size=limit_scan)
     app_ids = sorted([doc_ref.id for doc_ref in cols if doc_ref.id and doc_ref.id.isdigit()])
     return app_ids
 
 def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
-    """
-    Lit reviews_clean/{app_id}/items et normalise les colonnes attendues par l'UI.
-    """
+    """Lit reviews_clean/{app_id}/items et normalise les colonnes attendues."""
     items_col = db.collection("reviews_clean").document(str(app_id)).collection("items")
     docs = items_col.limit(limit).stream()
     rows = [d.to_dict() for d in docs]
@@ -72,7 +65,7 @@ def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
         ])
 
     df = df.copy()
-
+    # app_id
     if "app_id" not in df.columns:
         df["app_id"] = str(app_id)
     else:
@@ -133,13 +126,8 @@ def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
 def fs_get_game_name(app_id: str) -> str:
     return str(app_id)
 
-# Mode Firestore par défaut
-get_db = fs_get_db
-get_game_name = fs_get_game_name
-load_df = None  # inutilisé ici
-
 # -------------------------------------------------
-# ⚙️ Utilitaire de filtres (utilisable en tests)
+# ⚙️ Fonction utilitaire (tests)
 # -------------------------------------------------
 def apply_filters(
     df: pd.DataFrame,
@@ -180,9 +168,10 @@ def apply_filters(
     return out
 
 # -------------------------------------------------
-# ❌ UI Streamlit (non exécutée en tests)
+# UI Streamlit (pas en mode test)
 # -------------------------------------------------
 if not IS_TEST:
+    import json
     import streamlit as st
     import streamlit_authenticator as stauth
     from dotenv import load_dotenv
@@ -190,22 +179,33 @@ if not IS_TEST:
 
     # ------------- AUTH -------------
     AUTH_ON = (os.getenv("STREAMLIT_AUTH", "ON").upper() in ("1", "TRUE", "ON", "YES"))
+
     if AUTH_ON:
-        users_raw = os.getenv("AUTH_USERS_JSON", "[]")
+        # 1) Générer un hash pour le mot de passe "admin" (ou prendre depuis AUTH_USERS_JSON si fourni)
+        DEFAULT_USER = os.getenv("AUTH_DEFAULT_USER", "admin")
+        DEFAULT_NAME = os.getenv("AUTH_DEFAULT_NAME", "Admin")
+        default_pwd = os.getenv("AUTH_DEFAULT_PASSWORD", "admin")
+
+        # Hasher correctement (API récente: Hasher().generate([...]))
         try:
-            users = json.loads(users_raw)
+            default_hash = stauth.Hasher().generate([default_pwd])[0]
         except Exception:
-            users = []
+            # fallback si API différente
+            default_hash = stauth.Hasher([default_pwd]).generate()[0]
+
+        users_env = os.getenv("AUTH_USERS_JSON", "").strip()
+        users = []
+        if users_env:
+            try:
+                users = json.loads(users_env)
+            except Exception:
+                users = []
 
         if not users:
-            # Par défaut: crée admin/admin en générant le hash au démarrage
-            default_user = os.getenv("AUTH_DEFAULT_USER", "admin")
-            default_pwd  = os.getenv("AUTH_DEFAULT_PASSWORD", "admin")
-            hashed = stauth.Hasher().generate([default_pwd])[0]
             users = [{
-                "name": "Admin",
-                "username": default_user,
-                "password": hashed,
+                "name": DEFAULT_NAME,
+                "username": DEFAULT_USER,
+                "password": default_hash
             }]
 
         credentials = {
@@ -226,22 +226,12 @@ if not IS_TEST:
             cookie_expiry_days=cookie_days,
         )
 
-        # Compat: certaines versions renvoient un dict, d'autres un tuple,
-        # et tant que le formulaire n'est pas soumis -> None.
-        login_res = authenticator.login(location="main")
-
-        def _parse_login(res):
-            if isinstance(res, dict):
-                return (
-                    res.get("name"),
-                    res.get("authentication_status"),
-                    res.get("username"),
-                )
-            if isinstance(res, tuple) and len(res) == 3:
-                return res[0], res[1], res[2]
-            return None, None, None
-
-        name, auth_status, username = _parse_login(login_res)
+        # La méthode login peut retourner None selon versions => gérer prudemment
+        login_out = authenticator.login(location="main")
+        if isinstance(login_out, tuple) and len(login_out) == 3:
+            name, auth_status, username = login_out
+        else:
+            name, auth_status, username = None, None, None
 
         if auth_status is False:
             st.error("Identifiants invalides.")
@@ -250,8 +240,10 @@ if not IS_TEST:
             st.info("Veuillez vous authentifier.")
             st.stop()
 
-        st.sidebar.write(f"🔒 Connecté en tant que **{name or username}**")
-        authenticator.logout(button_name="Déconnexion", location="sidebar")
+        st.sidebar.write(f"🔒 Connecté en tant que **{name or 'utilisateur'}**")
+        if st.sidebar.button("Se déconnecter"):
+            authenticator.logout("Déconnexion", "sidebar")
+            st.stop()
 
     # ---------------------------------------------
     # Page config & CSS
@@ -264,7 +256,7 @@ if not IS_TEST:
     # DB & discovery (Firestore)
     # ---------------------------------------------
     try:
-        db = get_db()
+        db = fs_get_db()
     except Exception as e:
         st.error(f"Impossible d'initialiser Firestore: {e}")
         st.stop()
@@ -279,7 +271,7 @@ if not IS_TEST:
         st.error("Aucun jeu détecté dans Firestore (collection 'reviews_clean').")
         st.stop()
 
-    names = {app_id: get_game_name(app_id) for app_id in app_ids}
+    names = {app_id: fs_get_game_name(app_id) for app_id in app_ids}
     selected_app = st.selectbox("🎮 Jeu", options=app_ids, index=0, format_func=lambda a: names.get(a, a))
     st.markdown(f"### {names.get(selected_app, selected_app)}")
     st.image(f"https://cdn.akamai.steamstatic.com/steam/apps/{selected_app}/header.jpg", use_container_width=True)
@@ -352,7 +344,7 @@ if not IS_TEST:
         st.session_state.date_min, st.session_state.date_max = st.session_state.date_max, st.session_state.date_min
 
     # ---------------------------------------------
-    # Sidebar filters (avec "Toutes les langues")
+    # Sidebar filters
     # ---------------------------------------------
     def render_filters_sidebar(df, global_min, global_max):
         sb = st.sidebar
@@ -372,13 +364,9 @@ if not IS_TEST:
         if col_q3.button("90 j", key="f_q90"):
             st.session_state.date_min = max(global_min, global_max - timedelta(days=89)); st.session_state.date_max = global_max; st.rerun()
 
-        # Langues – bouton "Toutes les langues"
+        # Langues (simple pour l’instant — mapping complet possible plus tard)
         langs = sorted(df["language"].dropna().unique().tolist()) or ["unknown"]
-        all_langs = sb.checkbox("Toutes les langues", value=True, key="f_all_langs")
-        if all_langs:
-            chosen_langs = langs
-        else:
-            chosen_langs = sb.multiselect("🌐 Langues", options=langs, default=langs, key="f_langs")
+        chosen_langs = sb.multiselect("🌐 Langues", options=langs, default=langs, key="f_langs")
 
         sb.divider()
 
@@ -446,7 +434,6 @@ if not IS_TEST:
             st.session_state.f_play_mode = "Profils prédéfinis"
             st.session_state.f_profiles = present_profiles
             st.session_state.f_langs = langs
-            st.session_state.f_all_langs = True
             st.session_state.f_keywords = ""
             st.session_state.f_keywords_all = False
             st.session_state.f_hard_refresh = False
