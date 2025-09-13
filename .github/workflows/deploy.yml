@@ -9,16 +9,15 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      # Nouveau dossier propre, sans droits root hérités
       APP_DIR: /home/${{ secrets.SSH_USER }}/steamdb_app
       GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
       GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
-      FIRESTORE_PROJECT: ${{ secrets.FIRESTORE_PROJECT != '' && secrets.FIRESTORE_PROJECT || secrets.GCP_PROJECT }}
-
+      # Le fallback est géré plus bas lors de l'écriture du .env
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 1) Préparer l'arbo côté VM (sans sudo)
       - name: Prepare app dir on VM (no sudo)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -31,15 +30,15 @@ jobs:
           script: |
             set -euo pipefail
             echo "[INFO] Preparing $APP_DIR on $(hostname) as $(whoami)"
-            # Si l'ancien dossier existait avec des fichiers root, on l'ignore et on repart sur un neuf
             mkdir -p "$APP_DIR"
-            # Nettoyer uniquement ce que TU peux supprimer
+            # Nettoyer ce que l'utilisateur courant peut supprimer (on garde 'logs' si présent)
             find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name logs -exec rm -rf {} + || true
             # Arbo minimale
             mkdir -p "$APP_DIR/dags" "$APP_DIR/etl" "$APP_DIR/dashboard" "$APP_DIR/.github/workflows" "$APP_DIR/logs"
-            # Donner des droits permissifs aux logs pour l'UID 50000 dans le conteneur
+            # Donner des droits permissifs aux logs pour l'UID 50000 du conteneur Airflow
             chmod -R 0777 "$APP_DIR/logs" || true
 
+      # 2) Upload du dépôt
       - name: Upload project to VM
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -51,6 +50,7 @@ jobs:
           overwrite: true
           source: "."
 
+      # 3) Écrire .env puis lancer docker compose
       - name: Deploy (env + docker compose up)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -59,26 +59,36 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: 22
           script_stop: true
-          envs: APP_DIR,GCP_PROJECT,GCS_BUCKET,FIRESTORE_PROJECT
+          command_timeout: 60m
+          envs: APP_DIR
           script: |
-            set -euo pipefail
+            set -eu
             cd "$APP_DIR"
-        
-            # .env (réécrit à chaque déploiement)
+
+            # Nettoyage mineur
+            rm -rf .git || true
+
+            # Fallback FIRESTORE_PROJECT -> GCP_PROJECT si vide
+            FIRESTORE_PROJECT_VALUE="${{ secrets.FIRESTORE_PROJECT }}"
+            if [ -z "$FIRESTORE_PROJECT_VALUE" ]; then
+              FIRESTORE_PROJECT_VALUE="${{ secrets.GCP_PROJECT }}"
+            fi
+
+            # Génère .env consommé par docker-compose
             {
               echo "GCP_PROJECT=${{ secrets.GCP_PROJECT }}"
               echo "GCS_BUCKET=${{ secrets.GCS_BUCKET }}"
-              echo "FIRESTORE_PROJECT=${{ secrets.FIRESTORE_PROJECT || secrets.GCP_PROJECT }}"
+              echo "FIRESTORE_PROJECT=${FIRESTORE_PROJECT_VALUE}"
               echo "AIRFLOW_PORT=8081"
               echo "STREAMLIT_PORT=8501"
-              echo "COMPOSE_PROJECT_NAME=steamdb"
-              echo "VERSION_CODENAME=jammy"
+              # --- Auth Streamlit (maison) ---
+              echo "STREAMLIT_AUTH=${{ secrets.STREAMLIT_AUTH }}"
+              echo "AUTH_DEFAULT_USER=${{ secrets.AUTH_DEFAULT_USER }}"
+              echo "AUTH_DEFAULT_PASSWORD=${{ secrets.AUTH_DEFAULT_PASSWORD }}"
+              echo "AUTH_COOKIE_NAME=${{ secrets.AUTH_COOKIE_NAME }}"
             } > .env
-        
-            # Nettoyage d’un conteneur 'airflow' résiduel (hors-compose)
-            docker ps -a --filter "name=^/?airflow$" -q | xargs -r docker rm -f
-        
-            # Choix Compose
+
+            # Choisir la bonne commande compose
             if docker compose version >/dev/null 2>&1; then
               DC="docker compose"
             elif command -v docker-compose >/dev/null 2>&1; then
@@ -86,9 +96,30 @@ jobs:
             else
               echo "[ERROR] docker compose not installed"; exit 1
             fi
-        
-            # Down propre + up
-            $DC down -v --remove-orphans || true
+
             $DC pull || true
+            $DC down || true
             $DC up -d --build
             $DC ps
+
+      # 4) Health check rapide (optionnel)
+      - name: Health check (optional)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          script_stop: true
+          envs: APP_DIR
+          script: |
+            set -eu
+            cd "$APP_DIR"
+            if docker compose ps | grep -q airflow; then
+              echo "[INFO] Airflow containers:"
+              docker compose ps
+            fi
+            if docker compose ps | grep -q streamlit; then
+              echo "[INFO] Streamlit containers:"
+              docker compose ps
+            fi
