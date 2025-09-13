@@ -9,20 +9,17 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      # Dossier cible sur la VM
-      APP_DIR: /home/${{ secrets.SSH_USER }}/steamdb
-      # Variables projet (accessibles dans les steps)
+      # Nouveau dossier propre, sans droits root hérités
+      APP_DIR: /home/${{ secrets.SSH_USER }}/steamdb_app
       GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
       GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
-      # Fallback: si FIRESTORE_PROJECT est vide, on prend GCP_PROJECT
       FIRESTORE_PROJECT: ${{ secrets.FIRESTORE_PROJECT != '' && secrets.FIRESTORE_PROJECT || secrets.GCP_PROJECT }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) Préparer un dossier propre côté VM (on garde logs/ pour Airflow)
-      - name: Prepare app dir on VM
+      - name: Prepare app dir on VM (no sudo)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -34,22 +31,15 @@ jobs:
           script: |
             set -euo pipefail
             echo "[INFO] Preparing $APP_DIR on $(hostname) as $(whoami)"
-            sudo mkdir -p "$APP_DIR"
-            # rendre TON user proprio (sauf logs plus tard)
-            sudo chown -R "$USER":"$USER" "$APP_DIR"
+            # Si l'ancien dossier existait avec des fichiers root, on l'ignore et on repart sur un neuf
+            mkdir -p "$APP_DIR"
+            # Nettoyer uniquement ce que TU peux supprimer
+            find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name logs -exec rm -rf {} + || true
+            # Arbo minimale
+            mkdir -p "$APP_DIR/dags" "$APP_DIR/etl" "$APP_DIR/dashboard" "$APP_DIR/.github/workflows" "$APP_DIR/logs"
+            # Donner des droits permissifs aux logs pour l'UID 50000 dans le conteneur
+            chmod -R 0777 "$APP_DIR/logs" || true
 
-            # nettoyer tout sauf 'logs'
-            find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name logs -exec rm -rf {} +
-
-            # arbo minimale
-            mkdir -p "$APP_DIR/dags" "$APP_DIR/etl" "$APP_DIR/dashboard" "$APP_DIR/.github/workflows"
-
-            # logs pour Airflow (UID 50000)
-            sudo mkdir -p "$APP_DIR/logs"
-            sudo chown -R 50000:0 "$APP_DIR/logs"
-            sudo chmod -R g+rwX "$APP_DIR/logs"
-
-      # 2) Upload du dépôt vers la VM (on exclut logs/ et .git/)
       - name: Upload project to VM
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -64,7 +54,6 @@ jobs:
             !logs/**
             !.git/**
 
-      # 3) Déploiement via Docker Compose
       - name: Deploy (env + docker compose up)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -74,7 +63,6 @@ jobs:
           port: 22
           script_stop: true
           command_timeout: 60m
-          # On passe les env job au shell distant
           envs: APP_DIR,GCP_PROJECT,GCS_BUCKET,FIRESTORE_PROJECT
           script: |
             set -euo pipefail
@@ -108,8 +96,7 @@ jobs:
             $DC up -d --build
             $DC ps
 
-      # 4) Health check Airflow (optionnel)
-      - name: Airflow health check
+      - name: Airflow health check (optional)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -122,7 +109,6 @@ jobs:
             set -euo pipefail
             cd "$APP_DIR"
             if docker compose ps | grep -q airflow; then
-              # health endpoint (Airflow webserver dans le conteneur)
               docker compose exec -T airflow bash -lc 'curl -sf http://localhost:${AIRFLOW_PORT:-8081}/health || true'
             else
               echo "[WARN] Airflow container not found in compose ps"
