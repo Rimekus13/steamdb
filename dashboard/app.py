@@ -201,7 +201,7 @@ if not IS_TEST:
             # Par défaut: crée admin/admin en générant le hash au démarrage
             default_user = os.getenv("AUTH_DEFAULT_USER", "admin")
             default_pwd  = os.getenv("AUTH_DEFAULT_PASSWORD", "admin")
-            hashed = stauth.Hasher([default_pwd]).generate()[0]
+            hashed = stauth.Hasher().generate([default_pwd])[0]
             users = [{
                 "name": "Admin",
                 "username": default_user,
