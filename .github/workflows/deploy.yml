@@ -9,51 +9,47 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      APP_DIR: /home/${{ secrets.SSH_USER }}/steamdb   # dossier cible sur la VM
+      # Dossier cible sur la VM
+      APP_DIR: /home/${{ secrets.SSH_USER }}/steamdb
+      # Variables projet (accessibles dans les steps)
+      GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+      GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+      # Fallback: si FIRESTORE_PROJECT est vide, on prend GCP_PROJECT
+      FIRESTORE_PROJECT: ${{ secrets.FIRESTORE_PROJECT != '' && secrets.FIRESTORE_PROJECT || secrets.GCP_PROJECT }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) Préparer un dossier propre côté VM (pas de sudo)
+      # 1) Préparer un dossier propre côté VM (on garde logs/ pour Airflow)
       - name: Prepare app dir on VM
-      uses: appleboy/ssh-action@v1.0.3
-       with:
-      host: ${{ secrets.SSH_HOST }}
-      username: ${{ secrets.SSH_USER }}
-      key: ${{ secrets.SSH_KEY }}
-      script_stop: true
-      script: |
-      set -euo pipefail
-      APP_DIR="${APP_DIR:-$HOME/steamdb}"
-      echo "[INFO] Preparing $APP_DIR on $(hostname) as $(whoami)"
-      # Assurer que TON user est proprio du dépôt (sauf logs)
-      sudo mkdir -p "$APP_DIR"
-      sudo chown -R "$USER":"$USER" "$APP_DIR"
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          script_stop: true
+          envs: APP_DIR
+          script: |
+            set -euo pipefail
+            echo "[INFO] Preparing $APP_DIR on $(hostname) as $(whoami)"
+            sudo mkdir -p "$APP_DIR"
+            # rendre TON user proprio (sauf logs plus tard)
+            sudo chown -R "$USER":"$USER" "$APP_DIR"
 
-      # Nettoyer tout sauf 'logs' pour éviter les erreurs de droits et conserver les logs
-      find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name logs -exec rm -rf {} +
+            # nettoyer tout sauf 'logs'
+            find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name logs -exec rm -rf {} +
 
-      # Recréer l’arbo requise (si besoin)
-      mkdir -p "$APP_DIR/dags" "$APP_DIR/etl" "$APP_DIR/dashboard" "$APP_DIR/.github/workflows"
+            # arbo minimale
+            mkdir -p "$APP_DIR/dags" "$APP_DIR/etl" "$APP_DIR/dashboard" "$APP_DIR/.github/workflows"
 
-      # S'assurer que les logs sont ok pour Airflow (UID 50000)
-      sudo mkdir -p "$APP_DIR/logs"
-      sudo chown -R 50000:0 "$APP_DIR/logs"
-      sudo chmod -R g+rwX "$APP_DIR/logs"
+            # logs pour Airflow (UID 50000)
+            sudo mkdir -p "$APP_DIR/logs"
+            sudo chown -R 50000:0 "$APP_DIR/logs"
+            sudo chmod -R g+rwX "$APP_DIR/logs"
 
-      # (Optionnel) si tu veux régénérer le .env ici
-      cat > "$APP_DIR/.env" <<'EOF'
-      GCP_PROJECT=${{ secrets.GCP_PROJECT }}
-      GCS_BUCKET=${{ secrets.GCS_BUCKET }}
-      FIRESTORE_PROJECT=${{ secrets.FIRESTORE_PROJECT }}
-      AIRFLOW_PORT=8081
-      STREAMLIT_PORT=8501
-      APP_IDS_FILE=/opt/airflow/apps.txt
-      EOF
-
-
-      # 2) Upload du dépôt vers la VM
+      # 2) Upload du dépôt vers la VM (on exclut logs/ et .git/)
       - name: Upload project to VM
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -63,9 +59,12 @@ jobs:
           port: 22
           target: ${{ env.APP_DIR }}
           overwrite: true
-          source: "."   # envoie tout le repo tel quel
+          source: |
+            .
+            !logs/**
+            !.git/**
 
-      # 3) Nettoyage côté VM (retire .git, crée .env) puis docker compose
+      # 3) Déploiement via Docker Compose
       - name: Deploy (env + docker compose up)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -75,21 +74,23 @@ jobs:
           port: 22
           script_stop: true
           command_timeout: 60m
-          envs: APP_DIR
+          # On passe les env job au shell distant
+          envs: APP_DIR,GCP_PROJECT,GCS_BUCKET,FIRESTORE_PROJECT
           script: |
-            set -eu
+            set -euo pipefail
             cd "$APP_DIR"
 
-            # retire le .git pour éviter les anciens droits et les tar errors
+            # retirer un éventuel .git
             rm -rf .git || true
 
-            # génère le .env pour docker-compose (ajuste si besoin)
+            # générer .env pour docker-compose
             {
-              echo "GCP_PROJECT=${{ secrets.GCP_PROJECT }}"
-              echo "GCS_BUCKET=${{ secrets.GCS_BUCKET }}"
-              echo "FIRESTORE_PROJECT=${{ secrets.FIRESTORE_PROJECT || secrets.GCP_PROJECT }}"
+              echo "GCP_PROJECT=${GCP_PROJECT}"
+              echo "GCS_BUCKET=${GCS_BUCKET}"
+              echo "FIRESTORE_PROJECT=${FIRESTORE_PROJECT}"
               echo "AIRFLOW_PORT=8081"
               echo "STREAMLIT_PORT=8501"
+              echo "APP_IDS_FILE=/opt/airflow/apps.txt"
             } > .env
 
             # choisir la bonne commande compose
@@ -107,7 +108,7 @@ jobs:
             $DC up -d --build
             $DC ps
 
-      # 4) (Optionnel) Sanity check Airflow
+      # 4) Health check Airflow (optionnel)
       - name: Airflow health check
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -118,8 +119,11 @@ jobs:
           script_stop: true
           envs: APP_DIR
           script: |
-            set -eu
+            set -euo pipefail
             cd "$APP_DIR"
             if docker compose ps | grep -q airflow; then
+              # health endpoint (Airflow webserver dans le conteneur)
               docker compose exec -T airflow bash -lc 'curl -sf http://localhost:${AIRFLOW_PORT:-8081}/health || true'
+            else
+              echo "[WARN] Airflow container not found in compose ps"
             fi
