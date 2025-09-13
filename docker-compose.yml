@@ -28,23 +28,27 @@ services:
       - ./logs:/opt/airflow/logs
       - ./apps.txt:/opt/airflow/apps.txt:ro
       - ./requirements.txt:/opt/airflow/requirements.txt:ro
-    command: >
-      bash -lc "
-        set -euo pipefail &&
-        python -V &&
-        pip install --no-cache-dir -r /opt/airflow/requirements.txt &&
-        airflow db migrate &&
-        airflow users create \
-          --username admin \
-          --firstname Admin \
-          --lastname User \
-          --role Admin \
-          --email admin@example.com \
-          --password admin || true &&
-        # démarrer scheduler en arrière-plan puis le webserver
-        airflow scheduler & 
-        exec airflow webserver --port 8081
-      "
+    
+    command:
+      - bash
+      - -lc
+      - |
+          set -euo pipefail
+          python -V
+          pip install --no-cache-dir -r /opt/airflow/requirements.txt
+          airflow db migrate
+          # create admin/admin (idempotent: ignore error if it exists)
+          airflow users create \
+            --username "admin" \
+            --firstname "Admin" \
+            --lastname  "Admin" \
+            --role      "Admin" \
+            --email     "admin@example.com" \
+            --password  "admin" || true
+          # start scheduler then webserver
+          airflow scheduler &
+          exec airflow webserver --port 8081
+
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8081/health | grep -q healthy"]
       interval: 20s
