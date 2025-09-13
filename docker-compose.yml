@@ -1,54 +1,78 @@
+version: "3.9"
+
+name: steamdb
+
 services:
   airflow:
     image: apache/airflow:2.9.2
-    container_name: airflow
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
+      # Airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
-      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "True"
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "sqlite:////opt/airflow/airflow.db"
-      AIRFLOW__CORE__EXECUTOR: "SequentialExecutor"
-      AIRFLOW__WEBSERVER__WEB_SERVER_PORT: "${AIRFLOW_PORT:-8081}"
-
-      # Config ETL
-      BRONZE_MODE: "gcs"
+      AIRFLOW_UID: "${AIRFLOW_UID:-50000}"
+      AIRFLOW_GID: "${AIRFLOW_GID:-0}"
+      # ETL config (exploités par ton code)
       GCP_PROJECT: "${GCP_PROJECT}"
+      FIRESTORE_PROJECT: "${FIRESTORE_PROJECT:-${GCP_PROJECT}}"
       GCS_BUCKET: "${GCS_BUCKET}"
-      APP_IDS_FILE: "/opt/airflow/apps.txt"
-      FIRESTORE_PROJECT: "${FIRESTORE_PROJECT}"
-
-      PYTHONPATH: "/opt/airflow"
+      APP_IDS_FILE: "${APP_IDS_FILE:-/opt/airflow/apps.txt}"
+      PYTHONPATH: "/opt/airflow:/opt/airflow/etl:/opt/airflow/dashboard"
     ports:
-      - "${AIRFLOW_PORT:-8081}:${AIRFLOW_PORT:-8081}"
+      - "${AIRFLOW_PORT:-8081}:8081"
     volumes:
       - ./dags:/opt/airflow/dags
       - ./etl:/opt/airflow/etl
+      - ./dashboard:/opt/airflow/dashboard
+      - ./logs:/opt/airflow/logs
       - ./apps.txt:/opt/airflow/apps.txt:ro
       - ./requirements.txt:/opt/airflow/requirements.txt:ro
-
-      # 👇 Donne accès au Docker du host
-      - /var/run/docker.sock:/var/run/docker.sock
-      # (optionnel mais utile pour que le DC trouve le compose du projet)
-      - ./:/opt/airflow
     command: >
-      bash -lc '
-        set -e
-        pip install -r /opt/airflow/requirements.txt;
+      bash -lc "
+        set -euo pipefail &&
+        python -V &&
+        pip install --no-cache-dir -r /opt/airflow/requirements.txt &&
+        airflow db migrate &&
+        airflow users create
+          --username admin
+          --firstname admin
+          --lastname user
+          --role Admin
+          --email admin@example.com
+          --password admin || true &&
+        # démarrer scheduler en arrière-plan puis le webserver
+        airflow scheduler & 
+        exec airflow webserver --port 8081
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/health | grep -q healthy"]
+      interval: 20s
+      timeout: 5s
+      retries: 15
 
-        # ✅ Installe docker CLI et plugin compose dans le conteneur Airflow
-        apt-get update -y;
-        apt-get install -y ca-certificates curl gnupg;
-        install -m 0755 -d /etc/apt/keyrings;
-        curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg;
-        chmod a+r /etc/apt/keyrings/docker.gpg;
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
-        $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list;
-        apt-get update -y;
-        apt-get install -y docker-ce-cli docker-compose-plugin;
-
-        airflow db init;
-        (airflow users create --username ${AIRFLOW_USER:-admin} --password ${AIRFLOW_PWD:-admin} --firstname Admin --lastname User --role Admin --email admin@example.com) || true;
-        airflow scheduler & exec airflow webserver
-      ' 
-      
+  streamlit:
+    image: python:3.12-slim
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      GCP_PROJECT: "${GCP_PROJECT}"
+      FIRESTORE_PROJECT: "${FIRESTORE_PROJECT:-${GCP_PROJECT}}"
+      GCS_BUCKET: "${GCS_BUCKET}"
+      PYTHONUNBUFFERED: "1"
+    working_dir: /app
+    volumes:
+      - ./dashboard:/app
+      - ./requirements.txt:/app/requirements.txt:ro
+    command: >
+      bash -lc "
+        set -euo pipefail &&
+        python -V &&
+        pip install --no-cache-dir -r /app/requirements.txt streamlit &&
+        exec streamlit run app.py --server.port ${STREAMLIT_PORT:-8501} --server.address 0.0.0.0
+      "
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    depends_on:
+      - airflow
