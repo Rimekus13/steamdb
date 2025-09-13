@@ -1,4 +1,4 @@
-# app.py — Firestore + Auth robuste (streamlit-authenticator) + UI Steam Reviews
+# app.py — Firestore + Auth "maison" (admin/admin) + UI Steam Reviews
 import os
 import re
 from datetime import datetime, date, timedelta
@@ -143,9 +143,6 @@ def apply_filters(
     sentiment_range=None,
     search_terms=None
 ) -> pd.DataFrame:
-    """
-    Version minimaliste, indépendante de Streamlit/config, utilisée par les tests.
-    """
     out = df.copy()
 
     if "timestamp" in out.columns:
@@ -181,91 +178,52 @@ def apply_filters(
 # ❌ Tout ce qui suit (UI Streamlit) NE DOIT PAS s'exécuter sous pytest
 # -------------------------------------------------
 if not IS_TEST:
-    import json
     import streamlit as st
-    import streamlit_authenticator as stauth
     from dotenv import load_dotenv
     load_dotenv()
 
     # ---------------------------------------------
-    # AUTH robuste multi-versions (sans Hasher)
+    # AUTH simple "maison" (pas de lib externe)
     # ---------------------------------------------
     AUTH_ON = (os.getenv("STREAMLIT_AUTH", "ON").upper() in ("1", "TRUE", "ON", "YES"))
 
-    if AUTH_ON:
-        users_env = os.getenv("AUTH_USERS_JSON", "").strip()
-        credentials = None
-        if users_env:
-            try:
-                users = json.loads(users_env)
-                credentials = {
-                    "usernames": {
-                        u["username"]: {"name": u["name"], "password": u["password"]}
-                        for u in users
-                        if all(k in u for k in ("username", "name", "password"))
-                    }
-                }
-            except Exception:
-                credentials = None
+    def login_form():
+        st.markdown("## 🔐 Connexion")
+        with st.form("login_form", clear_on_submit=False):
+            u = st.text_input("Nom d'utilisateur", value="", key="__login_user__")
+            p = st.text_input("Mot de passe", type="password", value="", key="__login_pass__")
+            ok = st.form_submit_button("Se connecter")
+        return ok, u.strip(), p
 
-        # Fallback: admin/admin (bcrypt déjà hashé)
-        if not credentials:
-            ADMIN_BCRYPT = "$2b$12$KIXQ4Q.ZX7o9qpiapqYPOuNsq4CPGK/c/pXHiY/VKwxLBzME2Y8a2"
-            credentials = {"usernames": {"admin": {"name": "Admin", "password": ADMIN_BCRYPT}}}
+    def ensure_auth():
+        if "auth_ok" not in st.session_state:
+            st.session_state.auth_ok = False
+            st.session_state.auth_user = None
 
-        cookie_name = os.getenv("AUTH_COOKIE_NAME", "steamdb_auth")
-        cookie_key  = os.getenv("AUTH_COOKIE_KEY",  "change-me")
-        cookie_days = float(os.getenv("AUTH_COOKIE_EXPIRY_DAYS", "7"))
+        if not AUTH_ON:
+            st.session_state.auth_ok = True
+            st.session_state.auth_user = "public"
+            return True
 
-        authenticator = stauth.Authenticate(
-            credentials,
-            cookie_name,
-            cookie_key,
-            cookie_expiry_days=cookie_days,
-        )
+        expected_user = os.getenv("AUTH_DEFAULT_USER", "admin")
+        expected_pwd  = os.getenv("AUTH_DEFAULT_PASSWORD", "admin")
 
-        # Wrapper de login multi-signatures (selon la version installée)
-        def do_login():
-            attempts = [
-                lambda: authenticator.login("main", "Connexion"),           # (location, form_name)  ← versions récentes
-                lambda: authenticator.login("Connexion", "main"),           # (form_name, location)
-                lambda: authenticator.login(location="main"),               # (kw-only)
-                lambda: authenticator.login("Connexion"),                   # (form_name)
-                lambda: authenticator.login("main"),                        # (location)
-                lambda: authenticator.login("Connexion", location="main"),  # mix
-            ]
-            for call in attempts:
-                try:
-                    return call()
-                except Exception:
-                    continue
-            # Dernier essai (la plus probable) pour exposer l'erreur si tout échoue
-            return authenticator.login("main", "Connexion")
+        if st.session_state.auth_ok:
+            return True
 
-        login_out = do_login()
-        if isinstance(login_out, tuple) and len(login_out) == 3:
-            name, auth_status, username = login_out
-        else:
-            name = getattr(login_out, "name", None) if login_out else None
-            auth_status = getattr(login_out, "authentication_status", None) if login_out else None
-            username = getattr(login_out, "username", None) if login_out else None
+        ok, u, p = login_form()
+        if ok:
+            if u == expected_user and p == expected_pwd:
+                st.session_state.auth_ok = True
+                st.session_state.auth_user = u
+                st.experimental_rerun()
+            else:
+                st.error("Identifiants invalides.")
+        return False
 
-        if auth_status is False:
-            st.error("Identifiants invalides.")
-            st.stop()
-        elif auth_status is None:
-            st.info("Veuillez vous authentifier.")
-            st.stop()
-
-        st.sidebar.write(f"🔒 Connecté en tant que **{name or 'utilisateur'}**")
-        # Déconnexion (compat multi-versions)
-        try:
-            authenticator.logout("Déconnexion", "sidebar")
-        except Exception:
-            try:
-                authenticator.logout(location="sidebar")
-            except Exception:
-                pass
+    # ---- bloque tout si non authentifié ----
+    if not ensure_auth():
+        st.stop()
 
     # ---------------------------------------------
     # Page config & CSS
@@ -273,6 +231,12 @@ if not IS_TEST:
     st.set_page_config(page_title=APP_TITLE, layout=LAYOUT)
     if BASE_CSS:
         st.markdown(BASE_CSS, unsafe_allow_html=True)
+
+    # Sidebar: info + logout
+    st.sidebar.success(f"Connecté en tant que **{st.session_state.get('auth_user','?')}**")
+    if st.sidebar.button("Se déconnecter"):
+        st.session_state.clear()
+        st.experimental_rerun()
 
     # ---------------------------------------------
     # DB & discovery (Firestore)
@@ -375,20 +339,10 @@ if not IS_TEST:
 
         # 🎯 Essentiels
         sb.subheader("🎯 Essentiels")
-        dmin = sb.date_input(
-            "📅 Depuis",
-            value=st.session_state.date_min,
-            min_value=global_min,
-            max_value=global_max,
-            key="f_date_min"
-        )
-        dmax = sb.date_input(
-            "📅 Jusqu’à",
-            value=st.session_state.date_max,
-            min_value=global_min,
-            max_value=global_max,
-            key="f_date_max"
-        )
+        dmin = sb.date_input("📅 Depuis", value=st.session_state.date_min,
+                             min_value=global_min, max_value=global_max, key="f_date_min")
+        dmax = sb.date_input("📅 Jusqu’à", value=st.session_state.date_max,
+                             min_value=global_min, max_value=global_max, key="f_date_max")
         col_q1, col_q2, col_q3 = sb.columns(3)
         if col_q1.button("7 j", key="f_q7"):
             st.session_state.date_min = max(global_min, global_max - timedelta(days=6)); st.session_state.date_max = global_max; st.rerun()
@@ -397,12 +351,9 @@ if not IS_TEST:
         if col_q3.button("90 j", key="f_q90"):
             st.session_state.date_min = max(global_min, global_max - timedelta(days=89)); st.session_state.date_max = global_max; st.rerun()
 
-        # 🌐 Langues (simple — tu pourras brancher un mapping complet plus tard)
+        # 🌐 Langues
         langs = sorted(df["language"].dropna().unique().tolist()) or ["unknown"]
-        # "Toutes les langues" par défaut : on coche tout
-        default_langs = langs
-        chosen_langs = sb.multiselect("🌐 Langues", options=langs, default=default_langs, key="f_langs")
-        # Bouton pratique pour tout sélectionner
+        chosen_langs = sb.multiselect("🌐 Langues", options=langs, default=langs, key="f_langs")
         if sb.button("Tout sélectionner", key="f_langs_all"):
             st.session_state.f_langs = langs
             st.rerun()
@@ -447,10 +398,8 @@ if not IS_TEST:
 
         # 🙂 Sentiment
         sb.subheader("🙂 Sentiment")
-        senti_choice = sb.radio(
-            "", options=["Tous", "Positifs", "Neutres", "Négatifs"],
-            index=0, key="f_senti", horizontal=True
-        )
+        senti_choice = sb.radio("", options=["Tous", "Positifs", "Neutres", "Négatifs"],
+                                index=0, key="f_senti", horizontal=True)
 
         sb.divider()
 
@@ -581,7 +530,7 @@ if not IS_TEST:
         rows.append((th, freq))
     freq_df = pd.DataFrame(rows, columns=["Thème","Fréquence (%)"]).sort_values("Fréquence (%)", ascending=False)
 
-    # Tabs
+    # Tabs (tes modules)
     from tabs import (
         synthese, sentiment as t_sentiment, themes, langues, playtime,
         longueur, cooccurrences, anomalies, qualite,
@@ -611,4 +560,3 @@ if not IS_TEST:
     with tabs[8]: qualite.render(st, ctx)
     with tabs[9]: explorateur.render(st, ctx)
     with tabs[10]: updates.render(st, ctx)
-##
