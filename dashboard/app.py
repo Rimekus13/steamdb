@@ -235,7 +235,10 @@ if not IS_TEST:
             cookie_expiry_days=cookie_days,
         )
 
-        name, auth_status, username = authenticator.login("Connexion", "main")
+        name, auth_status, username = authenticator.login(
+           form_name="Connexion",
+           location="main",   # valeurs possibles: "main", "sidebar", "unrendered"
+        )
         if auth_status is False:
             st.error("Identifiants invalides.")
             st.stop()
