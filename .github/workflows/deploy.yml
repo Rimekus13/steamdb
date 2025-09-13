@@ -50,7 +50,7 @@ jobs:
           target: ${{ env.APP_DIR }}
           overwrite: true
           source: "."
-          
+
       - name: Deploy (env + docker compose up)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -59,26 +59,26 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: 22
           script_stop: true
-          command_timeout: 60m
           envs: APP_DIR,GCP_PROJECT,GCS_BUCKET,FIRESTORE_PROJECT
           script: |
             set -euo pipefail
             cd "$APP_DIR"
-
-            # retirer un éventuel .git
-            rm -rf .git || true
-
-            # générer .env pour docker-compose
+        
+            # .env (réécrit à chaque déploiement)
             {
-              echo "GCP_PROJECT=${GCP_PROJECT}"
-              echo "GCS_BUCKET=${GCS_BUCKET}"
-              echo "FIRESTORE_PROJECT=${FIRESTORE_PROJECT}"
+              echo "GCP_PROJECT=${{ secrets.GCP_PROJECT }}"
+              echo "GCS_BUCKET=${{ secrets.GCS_BUCKET }}"
+              echo "FIRESTORE_PROJECT=${{ secrets.FIRESTORE_PROJECT || secrets.GCP_PROJECT }}"
               echo "AIRFLOW_PORT=8081"
               echo "STREAMLIT_PORT=8501"
-              echo "APP_IDS_FILE=/opt/airflow/apps.txt"
+              echo "COMPOSE_PROJECT_NAME=steamdb"
+              echo "VERSION_CODENAME=jammy"
             } > .env
-
-            # choisir la bonne commande compose
+        
+            # Nettoyage d’un conteneur 'airflow' résiduel (hors-compose)
+            docker ps -a --filter "name=^/?airflow$" -q | xargs -r docker rm -f
+        
+            # Choix Compose
             if docker compose version >/dev/null 2>&1; then
               DC="docker compose"
             elif command -v docker-compose >/dev/null 2>&1; then
@@ -86,27 +86,9 @@ jobs:
             else
               echo "[ERROR] docker compose not installed"; exit 1
             fi
-
-            # build & run
+        
+            # Down propre + up
+            $DC down -v --remove-orphans || true
             $DC pull || true
-            $DC down || true
             $DC up -d --build
             $DC ps
-
-      - name: Airflow health check (optional)
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: 22
-          script_stop: true
-          envs: APP_DIR
-          script: |
-            set -euo pipefail
-            cd "$APP_DIR"
-            if docker compose ps | grep -q airflow; then
-              docker compose exec -T airflow bash -lc 'curl -sf http://localhost:${AIRFLOW_PORT:-8081}/health || true'
-            else
-              echo "[WARN] Airflow container not found in compose ps"
-            fi
