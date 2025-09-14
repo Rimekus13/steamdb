@@ -214,3 +214,4 @@ def build_gold(app_ids: Optional[List[str]] = None, for_airflow: bool = False) -
 
     print(f"[GOLD] Done. window={window} period={period} "
           f"rows_counts={len(counts)} rows_percent={len(pct)}")
+#
