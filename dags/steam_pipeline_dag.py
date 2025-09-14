@@ -35,7 +35,7 @@ with DAG(
         print("[DEBUG] bucket:", Config.gcs_bucket)
         for app_id in Config.app_ids:
             # ajuste pages/per_page si besoin
-            extract_app(app_id, mode="full", pages=20, per_page=100)
+            extract_app(app_id, mode="full", pages=50, per_page=100)
 
     def silver():
         dt = datetime.utcnow().strftime("%Y-%m-%d")
