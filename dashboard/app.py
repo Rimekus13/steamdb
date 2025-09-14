@@ -1,4 +1,4 @@
-# app.py — Firestore + Auth "maison" (séparée) + langues en clair + noms de jeux + compat schémas Firestore
+# app.py — Firestore + Auth "maison" (séparée) + langues en clair + noms de jeux (plat OU imbriqué)
 import os
 import re
 from datetime import datetime, date, timedelta
@@ -27,17 +27,14 @@ except Exception:
 
 # ====== Langues: code -> libellé ======
 LANG_MAP = {
-    # classiques Steam (codes Steam)
-    "english": "Anglais", "french": "Français", "german": "Allemand", "spanish": "Espagnol",
-    "latam": "Espagnol (Amérique latine)", "schinese": "Chinois simplifié", "tchinese": "Chinois traditionnel",
-    "japanese": "Japonais", "koreana": "Coréen", "russian": "Russe", "polish": "Polonais",
-    "portuguese": "Portugais", "brazilian": "Portugais (Brésil)", "italian": "Italien",
-    "turkish": "Turc", "thai": "Thaï", "vietnamese": "Vietnamien",
-    # parfois on a des ISO 2 lettres :
-    "en": "Anglais", "fr": "Français", "de": "Allemand", "es": "Espagnol", "pt": "Portugais",
-    "ru": "Russe", "zh": "Chinois", "ja": "Japonais", "ko": "Coréen", "pl": "Polonais", "it": "Italien",
-    # fallback
-    "unknown": "Inconnue",
+    "english":"Anglais","french":"Français","german":"Allemand","spanish":"Espagnol",
+    "latam":"Espagnol (Amérique latine)","schinese":"Chinois simplifié","tchinese":"Chinois traditionnel",
+    "japanese":"Japonais","koreana":"Coréen","russian":"Russe","polish":"Polonais",
+    "portuguese":"Portugais","brazilian":"Portugais (Brésil)","italian":"Italien",
+    "turkish":"Turc","thai":"Thaï","vietnamese":"Vietnamien",
+    "en":"Anglais","fr":"Français","de":"Allemand","es":"Espagnol","pt":"Portugais",
+    "ru":"Russe","zh":"Chinois","ja":"Japonais","ko":"Coréen","pl":"Polonais","it":"Italien",
+    "unknown":"Inconnue",
 }
 
 # ====== Firestore ======
@@ -49,88 +46,97 @@ def fs_get_db():
     from google.cloud import firestore
     return firestore.Client(project=PROJECT)
 
-# --- Détection des schémas et listage app_ids ---
-def _has_nested_schema(db) -> bool:
-    """
-    Retourne True si on détecte au moins un doc `reviews_clean/{app_id}/items/*`
-    """
-    try:
-        # on prend quelques doc ids top-level et on regarde s'il existe des items
-        for doc in db.collection("reviews_clean").list_documents(page_size=20):
-            if doc.id and doc.id.isdigit():
-                sub = doc.collection("items").limit(1).stream()
-                for _ in sub:
-                    return True
-        return False
-    except Exception:
-        return False
+def _list_app_ids_flat(db, max_pages: int = 50, page_size: int = 2000):
+    """Schéma PLAT: reviews_clean (doc_id = app__review). On agrège les app_id distincts."""
+    col = db.collection("reviews_clean")
+    ids = set()
+    last = None
+    for _ in range(max_pages):
+        q = col.limit(page_size)
+        if last is not None:
+            q = q.start_after(last)
+        docs = list(q.stream())
+        if not docs:
+            break
+        for d in docs:
+            app_id = (d.to_dict() or {}).get("app_id")
+            if app_id:
+                ids.add(str(app_id))
+        last = docs[-1]
+    return sorted(ids)
 
-def fs_list_app_ids(db, limit_scan: int = 2000):
-    """
-    - Schéma imbriqué : ids = doc ids (numériques) sous reviews_clean/.
-    - Schéma plat      : on scanne un lot et on prend les valeurs distinctes de `app_id`.
-    """
-    if _has_nested_schema(db):
-        docs = list(db.collection("reviews_clean").list_documents(page_size=limit_scan))
-        return sorted([d.id for d in docs if d.id and d.id.isdigit()])
-    # schéma plat
-    app_ids = set()
-    for doc in db.collection("reviews_clean").limit(limit_scan).stream():
-        data = doc.to_dict() or {}
-        aid = str(data.get("app_id", "")).strip()
-        if aid.isdigit():
-            app_ids.add(aid)
+def _list_app_ids_nested(db, limit_scan: int = 5000):
+    """Schéma IMBRIQUÉ: reviews_clean/{app_id}/items/{doc} → on prend les IDs top-level."""
+    cols = db.collection("reviews_clean").list_documents(page_size=limit_scan)
+    app_ids = [doc_ref.id for doc_ref in cols if doc_ref.id and doc_ref.id.isdigit()]
     return sorted(app_ids)
 
-# --- Lecture des reviews pour un app_id ---
+def fs_list_app_ids(db):
+    """Essaie PLAT puis, si vide, IMBRIQUÉ."""
+    ids = _list_app_ids_flat(db)
+    if ids:
+        return ids
+    return _list_app_ids_nested(db)
+
 def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
     """
-    Retourne un DataFrame normalisé depuis Firestore pour un app_id, compatible 2 schémas.
+    Charge les reviews pour un app_id en détectant le schéma.
+    - PLAT: query sur `reviews_clean` where app_id == selected
+    - IMBRIQUÉ: `reviews_clean/{app}/items/*`
     """
-    rows = []
-
-    if _has_nested_schema(db):
-        # Schéma imbriqué
-        items = db.collection("reviews_clean").document(str(app_id)).collection("items").limit(limit).stream()
-        rows = [d.to_dict() for d in items]
-    else:
-        # Schéma plat
-        q = (db.collection("reviews_clean")
-               .where("app_id", "==", str(app_id))
-               .limit(limit))
+    # 1) tentative PLAT
+    try:
+        col = db.collection("reviews_clean")
+        q = col.where("app_id", "==", str(app_id)).limit(limit)
         rows = [d.to_dict() for d in q.stream()]
+        if rows:
+            df = pd.DataFrame(rows)
+        else:
+            df = pd.DataFrame()
+    except Exception:
+        df = pd.DataFrame()
 
-    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    # 2) fallback IMBRIQUÉ
+    if df.empty:
+        try:
+            items_col = db.collection("reviews_clean").document(str(app_id)).collection("items")
+            docs = items_col.limit(limit).stream()
+            rows = [d.to_dict() for d in docs]
+            df = pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception:
+            df = pd.DataFrame()
 
     if df.empty:
-        # renvoyer DF avec colonnes attendues
         return pd.DataFrame(columns=[
             "review_date","language","voted_up","cleaned_review","review_text",
-            "compound","playtime_hours","timestamp_created","timestamp_updated","app_id",
-            "author_playtime_at_review","author_playtime_forever"
+            "compound","playtime_hours","timestamp_created","timestamp_updated","app_id"
         ])
 
     df = df.copy()
-    df["app_id"] = df.get("app_id", str(app_id)).astype(str)
+    # app_id
+    if "app_id" not in df.columns:
+        df["app_id"] = str(app_id)
+    else:
+        df["app_id"] = df["app_id"].astype(str)
 
-    # Texte
+    # texte → review_text
     if "cleaned_review" in df.columns:
         df["review_text"] = df["cleaned_review"].fillna("").astype(str)
     else:
         base_txt = "review_text" if "review_text" in df.columns else ("text" if "text" in df.columns else "review")
         df["review_text"] = df.get(base_txt, "").fillna("").astype(str)
 
-    # Langue
+    # langue
     if "language" not in df.columns:
         df["language"] = "unknown"
     else:
         df["language"] = df["language"].fillna("unknown").astype(str)
 
-    # Flags
+    # voted_up
     if "voted_up" not in df.columns:
         df["voted_up"] = pd.NA
 
-    # Dates
+    # dates
     if "review_date" in df.columns:
         df["review_date"] = pd.to_datetime(df["review_date"], errors="coerce")
     elif "timestamp_created" in df.columns:
@@ -138,26 +144,31 @@ def fs_fetch_clean_df(db, app_id: str, limit: int = 50000) -> pd.DataFrame:
     else:
         df["review_date"] = pd.NaT
 
-    # Sentiment
+    # sentiment
     if "compound" in df.columns:
         df["compound"] = pd.to_numeric(df["compound"], errors="coerce").fillna(0.0)
     else:
         df["compound"] = 0.0
 
-    # Playtime — priorise playtime au moment de l'avis, sinon total
-    df["author_playtime_at_review"] = pd.to_numeric(df.get("author_playtime_at_review"), errors="coerce")
-    df["author_playtime_forever"] = pd.to_numeric(df.get("author_playtime_forever"), errors="coerce")
+    # playtime heures — cherche plusieurs sources
     if "playtime_hours" in df.columns:
         df["playtime_hours"] = pd.to_numeric(df["playtime_hours"], errors="coerce")
     else:
-        minutes = df["author_playtime_at_review"].fillna(df["author_playtime_forever"])
-        df["playtime_hours"] = (minutes / 60.0).round(2)
+        # colonnes possibles côté Bronze/RAW
+        if "author_playtime_at_review" in df.columns:
+            df["playtime_hours"] = (pd.to_numeric(df["author_playtime_at_review"], errors="coerce")/60).round(2)
+        elif "author_playtime_forever" in df.columns:
+            df["playtime_hours"] = (pd.to_numeric(df["author_playtime_forever"], errors="coerce")/60).round(2)
+        elif "playtime_at_review" in df.columns:
+            df["playtime_hours"] = (pd.to_numeric(df["playtime_at_review"], errors="coerce")/60).round(2)
+        else:
+            df["playtime_hours"] = pd.NA
 
     return df
 
 # ====== Noms de jeux ======
-def fs_get_app_doc_name(db, app_id: str) -> str | None:
-    """Essaye d'abord Firestore: collection 'apps/{app_id}' {name: "..."}"""
+def fs_get_game_name(db, app_id: str) -> str:
+    """apps/{app_id} {name:'...'} si présent ; sinon l'ID."""
     try:
         doc = db.collection("apps").document(str(app_id)).get()
         if doc.exists:
@@ -167,29 +178,7 @@ def fs_get_app_doc_name(db, app_id: str) -> str | None:
                 return str(name)
     except Exception:
         pass
-    return None
-
-# API Steam en fallback
-import requests
-from functools import lru_cache
-
-@lru_cache(maxsize=512)
-def steam_name(app_id: str) -> str | None:
-    try:
-        r = requests.get(
-            f"https://store.steampowered.com/api/appdetails",
-            params={"appids": str(app_id), "l": "fr"},
-            timeout=10,
-        )
-        data = r.json()
-        if str(app_id) in data and data[str(app_id)]["success"]:
-            return data[str(app_id)]["data"]["name"]
-    except Exception:
-        return None
-    return None
-
-def fs_get_game_name(db, app_id: str) -> str:
-    return fs_get_app_doc_name(db, app_id) or steam_name(str(app_id)) or str(app_id)
+    return str(app_id)
 
 def fs_get_game_names_bulk(db, app_ids):
     return {appid: fs_get_game_name(db, appid) for appid in app_ids}
@@ -245,7 +234,7 @@ if not IS_TEST:
         st.error(f"Impossible d'initialiser Firestore: {e}")
         st.stop()
 
-    # Découvrir les jeux
+    # Liste des jeux (plat OU imbriqué)
     try:
         app_ids = fs_list_app_ids(db)
     except Exception as e:
@@ -256,8 +245,9 @@ if not IS_TEST:
         st.error("Aucun jeu détecté (collection 'reviews_clean').")
         st.stop()
 
-    # Noms des jeux (remplace les IDs à l’écran)
+    # Noms (apps/{app_id})
     names = fs_get_game_names_bulk(db, app_ids)
+
     selected_app = st.selectbox(
         "🎮 Jeu",
         options=app_ids,
@@ -294,7 +284,7 @@ if not IS_TEST:
             return "neutre"
     df["sentiment_label"] = df["sentiment"].apply(senti_label)
 
-    # Langue en clair (nouvelle colonne)
+    # Langue en clair
     df["language_norm"] = df["language"].astype(str).str.lower()
     df["language_full"] = df["language_norm"].map(LANG_MAP).fillna(df["language"])
 
@@ -311,12 +301,6 @@ if not IS_TEST:
         except Exception:
             return "Inconnu"
     df["playtime_hours"] = pd.to_numeric(df.get("playtime_hours", np.nan), errors="coerce")
-    if df["playtime_hours"].isna().all():
-        # Sécurité : (re)calcule à partir des minutes si nécessaire
-        minutes = pd.to_numeric(df.get("author_playtime_at_review"), errors="coerce").fillna(
-            pd.to_numeric(df.get("author_playtime_forever"), errors="coerce")
-        )
-        df["playtime_hours"] = (minutes / 60.0).round(2)
     df["play_profile"] = df["playtime_hours"].apply(play_profile)
 
     # Dates par défaut
@@ -457,7 +441,7 @@ if not IS_TEST:
 
     flt = render_filters_sidebar(df, global_min, global_max)
 
-    # Masque (utilise language_full pour l’affichage/filtrage)
+    # Masque (utilise language_full)
     mask = pd.Series(True, index=df.index)
 
     if flt["chosen_langs_full"]:
@@ -550,7 +534,7 @@ if not IS_TEST:
     with tabs[0]: synthese.render(st, ctx)
     with tabs[1]: t_sentiment.render(st, ctx)
     with tabs[2]: themes.render(st, ctx)
-    with tabs[3]: langues.render(st, ctx)          # ce module peut lire df["language_full"]
+    with tabs[3]: langues.render(st, ctx)          # si besoin, lire language_full dans ce module
     with tabs[4]: playtime.render(st, ctx)
     with tabs[5]: longueur.render(st, ctx)
     with tabs[6]: cooccurrences.render(st, ctx)
