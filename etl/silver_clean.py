@@ -312,31 +312,57 @@ def _firestore_upsert_rows(app_id: str, rows: List[Dict[str, Any]]) -> int:
         batch.commit()
     return n
 
-# -------------------------------------------------------------------
-# Entrée principale
-# -------------------------------------------------------------------
+# ---------- Entrée principale ----------
 
-def to_silver(app_id: str, dt_str: str, for_airflow: bool = False) -> str:
-    """
-    Lit le RAW depuis GCS, clean/normalise, et upsert le CLEAN dans Firestore.
-    Retourne la date traitée (dt_str).
-    """
-    print(f"[SILVER] start app_id={app_id} dt={dt_str}")
+from datetime import datetime as _dt
 
-    df = _read_raw_all(app_id, dt_str)
+def to_silver(
+    app_id: str,
+    date: str | None = None,          # nouveau nom "canonique"
+    *,
+    dt: str | None = None,            # alias rétro-compat (appel Airflow existant)
+    for_airflow: bool = False
+) -> str:
+    """
+    Lit le RAW depuis GCS (bronze), clean/normalise et upsert le CLEAN dans Firestore.
+    Accepte 'date' ou 'dt' (YYYY-MM-DD). Retourne la date réellement traitée.
+    """
+    # rétro-compat : si 'dt' fourni et pas 'date', on bascule dessus
+    if date is None and dt is not None:
+        date = dt
+    # valeur par défaut: aujourd'hui (UTC) si rien fourni
+    if not date:
+        date = _dt.utcnow().strftime("%Y-%m-%d")
+
+    # 1) lecture RAW
+    df = _read_raw_all(app_id, date)
     if df.empty:
-        print(f"[SILVER] no RAW for app_id={app_id} dt={dt_str} → skip")
-        return dt_str
+        print(f"[INFO] No RAW data for app_id={app_id}, dt={date}")
+        return date
 
+    # 2) normalisations
     df = _standardize_ids(df, app_id)
     df = _prep_timestamps(df)
-    df = _prep_text_and_language(df)
-    df = _prep_playtime_hours(df)
-    df = _prep_sentiment(df)
-    df = _select_and_fill_columns(df)
+    df = _prep_text_language_sentiment(df)
 
-    rows = df.to_dict("records")
+    # 3) colonnes utiles pour la suite (streamlit/gold)
+    keep = [
+        "app_id", "review_id",
+        "recommendationid",
+        "author", "language",
+        "voted_up", "votes_up", "votes_funny",
+        "weighted_vote_score",
+        "cleaned_review", "compound", "sentiment",
+        "timestamp_created", "timestamp_updated",
+        "review_date",
+    ]
+    for col in keep:
+        if col not in df.columns:
+            df[col] = None
+
+    rows = df[keep].to_dict("records")
     wrote = _firestore_upsert_rows(app_id, rows)
+    print(f"[SILVER] Upserted {wrote} rows for app_id={app_id}, dt={date}")
+    return date
 
-    print(f"[SILVER] upserted {wrote} rows to reviews_clean/{app_id}/items (dt={dt_str})")
-    return dt_str
+
