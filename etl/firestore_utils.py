@@ -1,7 +1,8 @@
 # etl/firestore_utils.py
 from typing import Iterable, Dict, List, Optional
-import os
+import os, time, random
 from google.cloud import firestore
+from google.api_core.exceptions import ServiceUnavailable, DeadlineExceeded, InternalServerError
 
 # ---------- Détection du projet ----------
 def _detect_project() -> Optional[str]:
@@ -24,7 +25,7 @@ def get_fs():
 def bulk_upsert_clean(rows: List[Dict]) -> None:
     """
     Upsert dans la collection *plate* `reviews_clean`.
-    Clé logique: (app_id + review_id) → doc_id = f\"{app_id}__{review_id}\".
+    Clé logique: (app_id + review_id) → doc_id = f"{app_id}__{review_id}".
     """
     if not rows:
         print("[SILVER] bulk_upsert_clean: 0 ligne → rien à faire")
@@ -41,7 +42,7 @@ def bulk_upsert_clean(rows: List[Dict]) -> None:
         doc_id = f"{app_id}__{review_id}"
         batch.set(col.document(doc_id), r, merge=True)
         i += 1
-        if i % 400 == 0:  # marge sous la limite 500 ops/batch
+        if i % 400 == 0:  # marge sous 500 ops
             batch.commit()
             batch = fs.batch()
     batch.commit()
@@ -67,95 +68,140 @@ def _iter_nested(fs, limit: int = 5):
             if yielded >= limit:
                 return
 
-def log_fs_state(sample: int = 5) -> None:
+def log_fs_state(sample: int = 3) -> None:
     """Affiche l’état des données Firestore pour faciliter le diagnostic."""
     fs = get_fs()
     project = _detect_project() or "<ADC par défaut>"
     print(f"[FS][DEBUG] Projet résolu: {project}")
 
-    # Collection plate
     flat_docs = list(fs.collection("reviews_clean").limit(1000).stream())
     print(f"[FS][DEBUG] `reviews_clean` (plat) — premiers 1000: {len(flat_docs)} doc(s)")
     for i, (doc_id, doc) in enumerate(_iter_flat(fs, limit=sample), 1):
         keys = list(doc.keys())
         print(f"[FS][DEBUG] plat échantillon {i}: id={doc_id} clés={keys[:12]}")
 
-    # Mise en page imbriquée (échantillons)
     nested_samples = list(_iter_nested(fs, limit=sample))
     print(f"[FS][DEBUG] imbriqué — échantillons (non exhaustif): {len(nested_samples)}")
     for i, (path, doc) in enumerate(nested_samples, 1):
         keys = list(doc.keys())
         print(f"[FS][DEBUG] imbriqué échantillon {i}: path={path} clés={keys[:12]}")
 
-# ---------- Lecteur unifié pour Gold ----------
+# ---------- Lecture unifiée pour Gold ----------
 def col_clean_query() -> List[Dict]:
     """
     Lecteur robuste pour Gold :
     1) essaie la collection *plate* `reviews_clean`;
     2) si vide, essaie la mise en page imbriquée `reviews_clean/{app_id}/items/*`
-       et *aplatit* les documents en une liste de dicts homogènes.
+       et *aplatit* en liste de dicts homogènes.
     """
     fs = get_fs()
     project = _detect_project() or "<ADC par défaut>"
     print(f"[GOLD][DEBUG] col_clean_query — projet = {project}")
 
-    # 1) lecture *plate*
-    flat_docs = list(fs.collection("reviews_clean").stream())
-    flat_count = len(flat_docs)
-    print(f"[GOLD][DEBUG] `reviews_clean` plat — nb docs: {flat_count}")
-    if flat_count > 0:
-        rows = [d.to_dict() for d in flat_docs]
-        if rows:
-            print(f"[GOLD][DEBUG] échantillon plat — clés: {list(rows[0].keys())[:12]}")
+    # 1) PLAT (paginé pour éviter les timeouts)
+    rows: List[Dict] = []
+    col = fs.collection("reviews_clean")
+    last = None
+    page_size = 2000
+    pages = 0
+    try:
+        while True:
+            q = col.order_by("__name__").limit(page_size)
+            if last is not None:
+                q = q.start_after(last)
+            docs = list(q.stream())
+            if not docs:
+                break
+            pages += 1
+            for d in docs:
+                rows.append(d.to_dict())
+            last = docs[-1]
+        print(f"[GOLD][DEBUG] `reviews_clean` plat — pages={pages}, docs={len(rows)}")
+    except Exception as e:
+        print(f"[GOLD][DEBUG] lecture PLAT a échoué: {e}")
+
+    if rows:
+        print(f"[GOLD][DEBUG] échantillon plat — clés: {list(rows[0].keys())[:12]}")
         return rows
 
-    # 2) fallback schéma imbriqué
+    # 2) IMBRIQUÉ
     print("[GOLD][DEBUG] plat vide → exploration schéma imbriqué reviews_clean/{app_id}/items/*")
-    rows: List[Dict] = []
     max_appdocs = 2000
-    per_items_limit = None  # None = tout lire; mettre un entier pour borner
-
+    per_items_limit = None  # None = tout lire; sinon int
     app_scanned = 0
+    rows_nested: List[Dict] = []
     for appdoc in fs.collection("reviews_clean").limit(max_appdocs).stream():
         app_scanned += 1
         app_id = appdoc.id
-        subq = appdoc.reference.collection("items")
+        sub = appdoc.reference.collection("items")
         if per_items_limit:
-            subq = subq.limit(per_items_limit)
-        for d in subq.stream():
+            sub = sub.limit(per_items_limit)
+        for d in sub.stream():
             rec = d.to_dict() or {}
-            # normalisations minimales attendues par Gold/Streamlit
             rec.setdefault("app_id", str(app_id))
             if "cleaned_review" not in rec:
                 txt = rec.get("review_text") or rec.get("review") or ""
                 rec["cleaned_review"] = txt
-            rows.append(rec)
+            rows_nested.append(rec)
+    print(f"[GOLD][DEBUG] imbriqué — lignes collectées: {len(rows_nested)} (sur ~{app_scanned} jeux)")
+    if rows_nested:
+        print(f"[GOLD][DEBUG] échantillon imbriqué — clés: {list(rows_nested[0].keys())[:12]}")
+    return rows_nested
 
-    print(f"[GOLD][DEBUG] imbriqué — lignes collectées: {len(rows)} (sur ~{app_scanned} jeux)")
-    if rows:
-        print(f"[GOLD][DEBUG] échantillon imbriqué — clés: {list(rows[0].keys())[:12]}")
-    return rows
+# ---------- Purge/Insert paginés & robustes ----------
+def _paged_delete(col_ref, batch_size: int = 300, max_retries: int = 5) -> int:
+    """
+    Supprime TOUTE la collection en pages ordonnées par __name__ (évite les timeouts).
+    Commit en batchs. Retourne le nombre de docs supprimés.
+    """
+    fs = get_fs()
+    deleted_total = 0
+    while True:
+        # stream la "page"
+        try:
+            docs = list(col_ref.order_by("__name__").limit(batch_size).stream())
+        except (ServiceUnavailable, DeadlineExceeded, InternalServerError) as e:
+            if max_retries <= 0:
+                print(f"[GOLD][PURGE] abandon: {e}")
+                raise
+            backoff = min(8, 2 ** (6 - max_retries)) + random.random()
+            print(f"[GOLD][PURGE] transient error {type(e).__name__}: retry in {backoff:.1f}s")
+            time.sleep(backoff)
+            max_retries -= 1
+            continue
 
-# ---------- Écriture des collections Gold ----------
+        if not docs:
+            break
+
+        # supprime cette page en batchs de 400
+        for i in range(0, len(docs), 400):
+            batch = fs.batch()
+            for d in docs[i:i+400]:
+                batch.delete(d.reference)
+            batch.commit()
+        deleted_total += len(docs)
+        # boucle: on relance une nouvelle page
+    return deleted_total
+
 def replace_collection(name: str, docs: Iterable[Dict], id_keys: Optional[List[str]] = None) -> None:
     """
-    Remplace complètement une collection Firestore (purge + insert).
-    id_keys: liste de champs pour forcer un ID déterministe (sinon ID auto).
+    Remplace complètement une collection Firestore (purge paginée + insert paginé).
+    id_keys: champs pour ID déterministe (sinon ID auto).
     """
     fs = get_fs()
     col_ref = fs.collection(name)
 
-    # Purge (par lots)
-    existing = list(col_ref.stream())
-    for i in range(0, len(existing), 400):
-        batch = fs.batch()
-        for doc in existing[i:i+400]:
-            batch.delete(doc.reference)
-        batch.commit()
-    print(f"[GOLD] Collection `{name}` purgée ({len(existing)} docs supprimés)")
+    # Purge paginée (robuste)
+    try:
+        deleted = _paged_delete(col_ref, batch_size=int(os.getenv("FS_DELETE_BATCH", "300")))
+    except Exception as e:
+        print(f"[GOLD] Purge `{name}` a échoué: {e}")
+        raise
+    print(f"[GOLD] Collection `{name}` purgée ({deleted} docs supprimés)")
 
-    docs = list(docs)
-    if not docs:
+    # Prépare à insérer
+    data = list(docs)
+    if not data:
         print(f"[GOLD] Aucune donnée à insérer dans `{name}`.")
         return
 
@@ -167,16 +213,17 @@ def replace_collection(name: str, docs: Iterable[Dict], id_keys: Optional[List[s
         except Exception:
             return None
 
-    # Insert (par lots)
-    i = 0
+    # Insert paginé (batchs de 400)
+    written = 0
     batch = fs.batch()
-    for d in docs:
+    for i, d in enumerate(data, 1):
         doc_id = _make_id(d)
         ref = col_ref.document(doc_id) if doc_id else col_ref.document()
         batch.set(ref, d)
-        i += 1
         if i % 400 == 0:
             batch.commit()
+            written += 400
             batch = fs.batch()
     batch.commit()
-    print(f"[GOLD] {i} doc(s) insérés dans `{name}` (id_keys={id_keys})")
+    written += len(data) % 400
+    print(f"[GOLD] {written} doc(s) insérés dans `{name}` (id_keys={id_keys})")
