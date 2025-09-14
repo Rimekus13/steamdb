@@ -1,27 +1,28 @@
 # etl/silver_clean.py
+from __future__ import annotations
+
 import io
 import json
 from typing import List, Dict, Any, Iterable
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pandas as pd
 
 from etl.gcp_clients import get_storage_client, get_firestore_client
 from etl.config import Config
-from etl.text_utils import clean_text, detect_lang, sentiment_scores  # déjà existants
+from etl.text_utils import clean_text, detect_lang, sentiment_scores
 
-# -------------------------------------------------------------------
-# Helpers GCS
-# -------------------------------------------------------------------
 
+# -----------------------------
+# --------- GCS I/O -----------
+# -----------------------------
 def _iter_gcs_ndjson(bucket_name: str, prefix: str) -> Iterable[Dict[str, Any]]:
     """
-    Lit tous les blobs GCS sous `prefix` et yield chaque ligne NDJSON -> dict.
-    On tolère d'autres fichiers mais on ne lit que le contenu texte.
+    Parcourt tous les blobs GCS sous `prefix` et yield chaque ligne NDJSON -> dict.
+    Attend des fichiers produits par bronze: bronze/raw/app_id=<ID>/dt=<YYYY-MM-DD>/data.ndjson
     """
     storage = get_storage_client()
     bucket = storage.bucket(bucket_name)
-
     for blob in bucket.list_blobs(prefix=prefix):
         data = blob.download_as_bytes().decode("utf-8", errors="ignore")
         for line in data.splitlines():
@@ -34,47 +35,28 @@ def _iter_gcs_ndjson(bucket_name: str, prefix: str) -> Iterable[Dict[str, Any]]:
                 print(f"[SILVER][WARN] NDJSON invalide ({blob.name}): {e}")
 
 
-def _read_raw_all(app_id: str, dt_str: str) -> pd.DataFrame:
+def _read_raw_all(app_id: str, dt: str) -> pd.DataFrame:
     """
-    Charge le RAW Bronze depuis GCS (NDJSON) pour un app_id/date.
-    Chemin attendu: bronze/raw/app_id=<ID>/dt=<YYYY-MM-DD>/...
+    Charge tout le RAW Bronze depuis GCS (NDJSON) pour un app_id/date.
+    Structure: bronze/raw/app_id=<ID>/dt=<YYYY-MM-DD>/...
     """
     bucket = Config.gcs_bucket
     if not bucket:
         raise RuntimeError("GCS_BUCKET non défini (Config.gcs_bucket).")
+    prefix = f"bronze/raw/app_id={app_id}/dt={dt}/"
+    rows: List[Dict[str, Any]] = list(_iter_gcs_ndjson(bucket, prefix))
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    prefix = f"bronze/raw/app_id={app_id}/dt={dt_str}/"
-    rows = list(_iter_gcs_ndjson(bucket, prefix))
-    if not rows:
-        return pd.DataFrame()
 
-    return pd.DataFrame(rows)
-
-# -------------------------------------------------------------------
-# Normalisation & enrichissements
-# -------------------------------------------------------------------
-
-# Mapping minimal codes -> libellés lisibles (complète au besoin)
-LANG_LABELS = {
-    "en": "English",
-    "fr": "Français",
-    "de": "Deutsch",
-    "es": "Español",
-    "it": "Italiano",
-    "pt": "Português",
-    "ru": "Русский",
-    "zh": "中文",
-    "ja": "日本語",
-    "ko": "한국어",
-}
-
+# ---------------------------------
+# --------- Normalisations --------
+# ---------------------------------
 def _standardize_ids(df: pd.DataFrame, app_id: str) -> pd.DataFrame:
     """
-    - garantit `app_id` & `review_id`
-    - `review_id` depuis `recommendationid` sinon fabrique <app_id>_<i>
+    - force app_id présent (string)
+    - crée review_id depuis recommendationid, sinon index synthétique.
     """
     df = df.copy()
-
     if "app_id" not in df.columns:
         df["app_id"] = str(app_id)
     else:
@@ -93,8 +75,8 @@ def _standardize_ids(df: pd.DataFrame, app_id: str) -> pd.DataFrame:
 
 def _prep_timestamps(df: pd.DataFrame) -> pd.DataFrame:
     """
-    - force `timestamp_created` / `timestamp_updated` en int (epoch s)
-    - dérive `review_date` (YYYY-MM-DD UTC) depuis `timestamp_created`
+    - cast timestamp_created / timestamp_updated -> int (epoch seconds)
+    - ajoute review_date (YYYY-MM-DD, UTC) dérivée de timestamp_created
     """
     df = df.copy()
     for c in ("timestamp_created", "timestamp_updated"):
@@ -103,196 +85,114 @@ def _prep_timestamps(df: pd.DataFrame) -> pd.DataFrame:
         else:
             df[c] = 0
 
-    # Review date lisible
-    df["review_date"] = (
-        pd.to_datetime(df["timestamp_created"], unit="s", utc=True, errors="coerce")
-        .dt.date.astype(str)
-        .fillna("")
-    )
-    return df
-
-
-def _prep_text_and_language(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    - choisit colonne de texte -> `review_text`
-    - `cleaned_review` via clean_text()
-    - `language` code ISO minuscule (fallback detect_lang)
-    - `language_label` libellé lisible
-    """
-    df = df.copy()
-
-    # 1) texte source -> review_text
-    text_col = None
-    for cand in ("review", "review_text", "text", "cleaned_review"):
-        if cand in df.columns:
-            text_col = cand
-            break
-    df["review_text"] = df[text_col].fillna("").astype(str) if text_col else ""
-
-    # 2) cleaned
-    df["cleaned_review"] = df["review_text"].map(clean_text)
-
-    # 3) language code
-    if "language" not in df.columns:
-        df["language"] = ""
-
-    df["language"] = (
-        df["language"].fillna("").astype(str).str.strip().str.lower()
-    )
-
-    need_detect = df["language"].eq("") | df["language"].eq("unknown")
-    if need_detect.any():
-        df.loc[need_detect, "language"] = df.loc[need_detect, "cleaned_review"].map(detect_lang).fillna("")
-
-    # sécurise: garde un code court (ex langdetect peut renvoyer 'en')
-    df["language"] = df["language"].str[:5].str.lower().replace("", "unknown")
-
-    # 4) label lisible
-    df["language_label"] = df["language"].map(LANG_LABELS).fillna(df["language"].str.upper())
-
+    dt_series = pd.to_datetime(df["timestamp_created"], unit="s", utc=True, errors="coerce")
+    df["review_date"] = dt_series.dt.date.astype(str).fillna("")
     return df
 
 
 def _prep_playtime_hours(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcule `playtime_hours` depuis les champs auteur si présents :
-    - author.playtime_at_review
-    - author.playtime_forever
-    - author.playtime_last_two_weeks
-    Valeurs en minutes -> heures (float, 2 décimales).
+    Crée playtime_hours à partir des champs Steam (minutes -> heures):
+      - author.playtime_at_review
+      - author.playtime_forever
+      - author.playtime_last_two_weeks (fallback si rien)
+    Les colonnes peuvent être soit imbriquées dans 'author' (dict), soit à plat
+    (author_playtime_*) selon le bronze.
     """
     df = df.copy()
 
-    # déjà à plat ?
-    # sinon lire dict `author`
-    # On essaie d'abord les colonnes "aplaties" si elles existent.
-    cols_flat = {
-        "author_playtime_at_review",
-        "author_playtime_forever",
-        "author_playtime_last_two_weeks",
-    }
+    # 1) si bronze a aplati (author_playtime_*)
+    if "author_playtime_at_review" in df.columns:
+        at_rev = pd.to_numeric(df["author_playtime_at_review"], errors="coerce")
+    else:
+        # 2) sinon, essayer d'aller chercher dans l'objet author
+        def _get_author_field(x, key):
+            if isinstance(x, dict):
+                return x.get(key)
+            return None
 
-    author_dict_possible = "author" in df.columns
+        if "author" in df.columns:
+            at_rev = df["author"].map(lambda x: _get_author_field(x, "playtime_at_review"))
+        else:
+            at_rev = None
 
-    def _extract_minutes(row) -> float:
-        # priorité: at_review > forever > last_two_weeks
-        # renvoie minutes (float) ou NaN
-        def _to_num(x):
-            try:
-                return float(x)
-            except Exception:
-                return float("nan")
+        at_rev = pd.to_numeric(at_rev, errors="coerce")
 
-        # a) colonnes aplat ies
-        if any(c in df.columns for c in cols_flat):
-            ar = _to_num(row.get("author_playtime_at_review"))
-            if pd.notna(ar):
-                return ar
-            fr = _to_num(row.get("author_playtime_forever"))
-            if pd.notna(fr):
-                return fr
-            tw = _to_num(row.get("author_playtime_last_two_weeks"))
-            if pd.notna(tw):
-                return tw
+    # fallback: forever
+    if "author_playtime_forever" in df.columns:
+        forever = pd.to_numeric(df["author_playtime_forever"], errors="coerce")
+    else:
+        if "author" in df.columns:
+            forever = df["author"].map(lambda x: x.get("playtime_forever") if isinstance(x, dict) else None)
+        else:
+            forever = None
+        forever = pd.to_numeric(forever, errors="coerce")
 
-        # b) dict author
-        if author_dict_possible:
-            author = row.get("author")
-            if isinstance(author, dict):
-                ar = _to_num(author.get("playtime_at_review"))
-                if pd.notna(ar):
-                    return ar
-                fr = _to_num(author.get("playtime_forever"))
-                if pd.notna(fr):
-                    return fr
-                tw = _to_num(author.get("playtime_last_two_weeks"))
-                if pd.notna(tw):
-                    return tw
+    # dernier recours: last two weeks
+    if "author_playtime_last_two_weeks" in df.columns:
+        last2 = pd.to_numeric(df["author_playtime_last_two_weeks"], errors="coerce")
+    else:
+        if "author" in df.columns:
+            last2 = df["author"].map(lambda x: x.get("playtime_last_two_weeks") if isinstance(x, dict) else None)
+        else:
+            last2 = None
+        last2 = pd.to_numeric(last2, errors="coerce")
 
-        return float("nan")
-
-    minutes = df.apply(_extract_minutes, axis=1)
-    hours = (pd.to_numeric(minutes, errors="coerce") / 60.0).round(2)
+    # priorité: at_review > forever > last2
+    play_minutes = at_rev.fillna(forever).fillna(last2)
+    hours = (play_minutes.fillna(0) / 60.0).astype(float).round(2)
     df["playtime_hours"] = hours
 
     return df
 
 
-def _prep_sentiment(df: pd.DataFrame) -> pd.DataFrame:
+def _prep_text_language_sentiment(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcule `compound` (float) + `sentiment` (neg/neu/pos).
-    Si `compound` existe déjà, on le garde (en coerce).
+    - choisit review/review_text/text comme source
+    - cleaned_review via clean_text()
+    - language: garde existant sinon détecte
+    - sentiment via sentiment_scores(): 'compound' + label neg/neu/pos
     """
     df = df.copy()
 
-    if "compound" in df.columns:
-        df["compound"] = pd.to_numeric(df["compound"], errors="coerce").fillna(0.0)
+    # Texte source
+    text_col = None
+    for cand in ("review", "review_text", "text"):
+        if cand in df.columns:
+            text_col = cand
+            break
+    if text_col is None:
+        df["cleaned_review"] = ""
     else:
-        scores = df["cleaned_review"].map(sentiment_scores)
-        df["compound"] = [s.get("compound", 0.0) for s in scores]
+        df[text_col] = df[text_col].fillna("").astype(str)
+        df["cleaned_review"] = df[text_col].map(clean_text)
 
+    # Langue
+    if "language" not in df.columns:
+        df["language"] = ""
+    df["language"] = df["language"].fillna("").astype(str)
+    need_detect = df["language"].eq("") | df["language"].eq("unknown")
+    if need_detect.any():
+        df.loc[need_detect, "language"] = df.loc[need_detect, "cleaned_review"].map(detect_lang)
+
+    # Sentiment
+    sents = df["cleaned_review"].map(sentiment_scores)
+    df["compound"] = [float(s.get("compound", 0.0)) for s in sents]
     df["sentiment"] = pd.cut(
-        df["compound"],
-        bins=[-1.0, -0.05, 0.05, 1.0],
-        labels=["neg", "neu", "pos"],
-        include_lowest=True,
+        df["compound"], bins=[-1.0, -0.05, 0.05, 1.0],
+        labels=["neg", "neu", "pos"], include_lowest=True
     ).astype(str)
 
     return df
 
 
-def _select_and_fill_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Construit le jeu de colonnes final aligné à ton schéma `reviews_clean`.
-    On garde aussi `playtime_hours` & `language_label` utiles pour le front.
-    """
-    keep = [
-        "app_id",
-        "review_id",
-        "cleaned_review",
-        "compound",
-        "sentiment",
-        "language",
-        "language_label",
-        "review_date",
-        "timestamp_created",
-        "timestamp_updated",
-        "voted_up",
-        "votes_funny",
-        "votes_up",
-        "weighted_vote_score",
-        "playtime_hours",
-        # on laisse `review_text` pour debug/usage éventuel
-        "review_text",
-    ]
-    out = df.reindex(columns=keep, fill_value=None).copy()
-
-    # types de base
-    for c in ("voted_up",):
-        if c in out.columns:
-            out[c] = out[c].astype("boolean")
-
-    for c in ("votes_funny", "votes_up"):
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
-
-    if "weighted_vote_score" in out.columns:
-        # ce champ est parfois une string numérique
-        out["weighted_vote_score"] = out["weighted_vote_score"].astype(str)
-
-    # review_date toujours string YYYY-MM-DD (déjà géré)
-    out["review_date"] = out["review_date"].fillna("")
-
-    return out
-
-# -------------------------------------------------------------------
-# Firestore
-# -------------------------------------------------------------------
-
+# ----------------------------------------
+# --------- Publication Firestore --------
+# ----------------------------------------
 def _firestore_upsert_rows(app_id: str, rows: List[Dict[str, Any]]) -> int:
     """
-    Upsert en batch dans Firestore:
-    collection reviews_clean / document <app_id> / subcollection items / doc <review_id>
+    Upsert en batch:
+      collection 'reviews_clean' / doc <app_id> / sub 'items' / doc <review_id>
     """
     db = get_firestore_client()
     col = db.collection("reviews_clean").document(str(app_id)).collection("items")
@@ -307,45 +207,30 @@ def _firestore_upsert_rows(app_id: str, rows: List[Dict[str, Any]]) -> int:
         if n % 450 == 0:
             batch.commit()
             batch = db.batch()
-
     if n % 450 != 0:
         batch.commit()
     return n
 
-# ---------- Entrée principale ----------
 
-from datetime import datetime as _dt
-
-def to_silver(
-    app_id: str,
-    date: str | None = None,          # nouveau nom "canonique"
-    *,
-    dt: str | None = None,            # alias rétro-compat (appel Airflow existant)
-    for_airflow: bool = False
-) -> str:
+# ----------------------------------------
+# --------- Entrée principale -----------
+# ----------------------------------------
+def to_silver(app_id: str, dt: str, for_airflow: bool = False) -> str:
     """
-    Lit le RAW depuis GCS (bronze), clean/normalise et upsert le CLEAN dans Firestore.
-    Accepte 'date' ou 'dt' (YYYY-MM-DD). Retourne la date réellement traitée.
+    Lit le RAW depuis GCS, clean/normalise, calcule playtime_hours & sentiment,
+    puis upsert dans Firestore. Retourne dt (chaîne 'YYYY-MM-DD').
     """
-    # rétro-compat : si 'dt' fourni et pas 'date', on bascule dessus
-    if date is None and dt is not None:
-        date = dt
-    # valeur par défaut: aujourd'hui (UTC) si rien fourni
-    if not date:
-        date = _dt.utcnow().strftime("%Y-%m-%d")
-
-    # 1) lecture RAW
-    df = _read_raw_all(app_id, date)
+    df = _read_raw_all(app_id, dt)
     if df.empty:
-        print(f"[INFO] No RAW data for app_id={app_id}, dt={date}")
-        return date
+        print(f"[SILVER] Aucun RAW pour app_id={app_id}, dt={dt}")
+        return dt
 
-    # 2) normalisations
     df = _standardize_ids(df, app_id)
     df = _prep_timestamps(df)
+    df = _prep_playtime_hours(df)
     df = _prep_text_language_sentiment(df)
 
-    # 3) colonnes utiles pour la suite (streamlit/gold)
+    # colonnes utiles pour l’UI Streamlit
     keep = [
         "app_id", "review_id",
         "recommendationid",
@@ -355,14 +240,14 @@ def to_silver(
         "cleaned_review", "compound", "sentiment",
         "timestamp_created", "timestamp_updated",
         "review_date",
+        "playtime_hours",
     ]
+    # éviter KeyError si champs absents
     for col in keep:
         if col not in df.columns:
             df[col] = None
 
     rows = df[keep].to_dict("records")
     wrote = _firestore_upsert_rows(app_id, rows)
-    print(f"[SILVER] Upserted {wrote} rows for app_id={app_id}, dt={date}")
-    return date
-
-
+    print(f"[SILVER] Upserted {wrote} rows → reviews_clean/{app_id}/items/*  (dt={dt})")
+    return dt
