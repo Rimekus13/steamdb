@@ -227,3 +227,4 @@ def replace_collection(name: str, docs: Iterable[Dict], id_keys: Optional[List[s
     batch.commit()
     written += len(data) % 400
     print(f"[GOLD] {written} doc(s) insérés dans `{name}` (id_keys={id_keys})")
+#
