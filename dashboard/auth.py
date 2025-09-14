@@ -37,7 +37,7 @@ def ensure_auth():
         if u == expected_user and p == expected_pwd:
             st.session_state.auth_ok = True
             st.session_state.auth_user = u
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Identifiants invalides.")
     return False
@@ -45,4 +45,4 @@ def ensure_auth():
 def render_logout():
     if st.sidebar.button("Se déconnecter"):
         st.session_state.clear()
-        st.experimental_rerun()
+        st.rerun()
