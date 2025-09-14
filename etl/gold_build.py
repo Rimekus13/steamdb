@@ -1,25 +1,23 @@
 # etl/gold_build.py
-from typing import List, Iterable, Tuple, Optional
-from datetime import datetime
 import pandas as pd
+from datetime import datetime
+from typing import List, Iterable, Tuple, Optional
 
 from .text_utils import tokenize_no_stop
-from .firestore_utils import col_clean_query, replace_collection
+from .firestore_utils import col_clean_query, replace_collection, log_fs_state
 
-# Paramètres de calcul
-WINDOW = 5                    # taille de fenêtre de cooccurrence (glissante)
-TOP_K: Optional[int] = None   # None = pas de coupe ; sinon limite le nb de lignes insérées
+WINDOW = 5                    # taille de fenêtre de cooccurrence
+TOP_K: Optional[int] = None   # None = pas de coupe ; sinon limite le nombre de lignes publiées
 
-
-def _period_from_row(row) -> Optional[str]:
+def _periode_depuis_ligne(row) -> Optional[str]:
     """
-    Période mensuelle :
+    Période mensuelle (YYYY-MM) :
       - priorité à review_date (YYYY-MM-DD) → YYYY-MM
-      - sinon fallback timestamp_created (epoch sec) → YYYY-MM
+      - sinon fallback sur timestamp_created (epoch sec) → YYYY-MM
     """
     rd = row.get("review_date")
     if isinstance(rd, str) and len(rd) >= 7:
-        return rd[:7]  # 'YYYY-MM'
+        return rd[:7]
     ts = row.get("timestamp_created")
     if pd.notna(ts):
         try:
@@ -28,11 +26,10 @@ def _period_from_row(row) -> Optional[str]:
             pass
     return None
 
-
-def _pairs_within_window(tokens: List[str], window: int = WINDOW) -> Iterable[Tuple[str, str]]:
+def _paires_fenetre(tokens: List[str], window: int = WINDOW):
     """
-    Fenêtre glissante : pour chaque i, on prend les tokens j dans (i, i+window).
-    (a,b) est normalisé (ordre trié) pour éviter les doublons (a,b)/(b,a).
+    Fenêtre glissante : pour chaque i, prend les tokens j dans (i, i+window).
+    On normalise l’ordre (a,b) trié pour éviter les doublons (a,b)/(b,a).
     """
     n = len(tokens)
     for i in range(n):
@@ -43,97 +40,78 @@ def _pairs_within_window(tokens: List[str], window: int = WINDOW) -> Iterable[Tu
             if a != b:
                 yield tuple(sorted((a, b)))
 
-
-def _read_clean_all() -> pd.DataFrame:
-    """
-    Lit l'intégralité de la source CLEAN (Firestore → reviews_clean).
-    On s’attend à trouver au minimum : app_id, cleaned_review, review_date|timestamp_created.
-    """
-    rows = col_clean_query()
-    return pd.DataFrame(rows)
-
-
 def build_gold(app_ids: Optional[List[str]] = None, for_airflow: bool = False) -> None:
     """
-    Calcule les tables Gold et remplace complètement les collections Firestore :
-      - cooccurrences_counts:  {app_id, token_a, token_b, window, count,   period}
-      - cooccurrences_percent: {app_id, token_a, token_b, window, percent, period}
-
-    Si app_ids est fourni, on filtre le calcul à ces jeux ; sinon on prend tous les app_id présents.
+    Construit et publie les tables Gold dans Firestore :
+      - cooccurrences_counts  {app_id, token_a, token_b, window, count,  period}
+      - cooccurrences_percent {app_id, token_a, token_b, window, percent, period}
     """
-    print("[GOLD] Lecture reviews_clean…")
-    df = _read_clean_all()
-    if df.empty:
-        print("[GOLD] reviews_clean vide → purge des collections de cooccurrences.")
+    print("[GOLD] Inspection de l’état Firestore…")
+    log_fs_state(sample=3)
+
+    print("[GOLD] Lecture de reviews_clean…")
+    df = pd.DataFrame(col_clean_query())
+    print(f"[GOLD] Lignes chargées depuis CLEAN: {len(df)}")
+    if df.empty or "cleaned_review" not in df.columns:
+        print("[GOLD] CLEAN vide ou colonne `cleaned_review` absente → purge des cooccurrences et sortie.")
         replace_collection("cooccurrences_counts", [])
         replace_collection("cooccurrences_percent", [])
         return
 
-    # Normalisations de base
-    if "cleaned_review" not in df.columns:
-        df["cleaned_review"] = df.get("review_text", "").fillna("").astype(str)
-    else:
-        df["cleaned_review"] = df["cleaned_review"].fillna("").astype(str)
-
+    # Normalisations
     if "app_id" not in df.columns:
         df["app_id"] = ""
     df["app_id"] = df["app_id"].astype(str)
 
-    # Tokenisation + période mensuelle
-    print("[GOLD] Tokenisation & période mensuelle…")
-    df["tokens"] = df["cleaned_review"].map(tokenize_no_stop)
-    df["period"] = df.apply(_period_from_row, axis=1)
-
-    # Filtrages minimaux
-    df = df[(df["tokens"].map(len) >= 2) & df["period"].notna() & df["app_id"].ne("")]
-    if df.empty:
-        print("[GOLD] Aucun document exploitable après filtrage → purge.")
-        replace_collection("cooccurrences_counts", [])
-        replace_collection("cooccurrences_percent", [])
-        return
-
-    # Filtre optionnel par app_ids
+    # Option : filtrer sur certaines apps
     if app_ids:
         allow = {str(a) for a in app_ids}
         df = df[df["app_id"].isin(allow)]
-        if df.empty:
-            print(f"[GOLD] Aucun document pour app_ids={allow} → purge.")
-            replace_collection("cooccurrences_counts", [])
-            replace_collection("cooccurrences_percent", [])
-            return
+        print(f"[GOLD] Filtre app_ids → {len(df)} lignes")
 
-    # Génération des paires (ligne → paires dans fenêtre), puis agrégation globale
-    print("[GOLD] Génération de paires de tokens…")
-    records = []
-    for _, row in df.iterrows():
-        app_id = row["app_id"]
-        period = row["period"]
-        toks = row["tokens"]
-        for a, b in _pairs_within_window(toks, window=WINDOW):
-            records.append((app_id, period, a, b, 1))
+    # Tokenisation + période mensuelle
+    df["tokens"] = df["cleaned_review"].fillna("").map(tokenize_no_stop)
+    df["period"] = df.apply(_periode_depuis_ligne, axis=1)
 
-    if not records:
-        print("[GOLD] 0 paire générée → purge.")
+    # Filtre qualité minimum
+    df = df[(df["tokens"].map(len) >= 2) & df["period"].notna() & df["app_id"].ne("")]
+    print(f"[GOLD] Après filtrage (tokens>=2 & période & app_id) → {len(df)} lignes")
+
+    if df.empty:
         replace_collection("cooccurrences_counts", [])
         replace_collection("cooccurrences_percent", [])
         return
 
-    rec_df = pd.DataFrame(records, columns=["app_id", "period", "token_a", "token_b", "count"])
-    co_counts = (
-        rec_df.groupby(["app_id", "period", "token_a", "token_b"], as_index=False)["count"]
-        .sum()
-    )
+    # Génération des paires dans la fenêtre
+    recs = []
+    for _, row in df.iterrows():
+        app_id = row["app_id"]
+        period = row["period"]
+        for a, b in _paires_fenetre(row["tokens"], window=WINDOW):
+            recs.append((app_id, period, a, b, 1))
 
-    # Totaux par (app_id, period) pour le pourcentage
-    totals = (
-        co_counts.groupby(["app_id", "period"], as_index=False)["count"]
-        .sum()
-        .rename(columns={"count": "total_pairs"})
-    )
+    if not recs:
+        print("[GOLD] Aucune paire générée → purge & sortie.")
+        replace_collection("cooccurrences_counts", [])
+        replace_collection("cooccurrences_percent", [])
+        return
+
+    rec_df = pd.DataFrame(recs, columns=["app_id", "period", "token_a", "token_b", "count"])
+    co_counts = (rec_df
+                 .groupby(["app_id", "period", "token_a", "token_b"], as_index=False)["count"]
+                 .sum())
+    print(f"[GOLD] cooccurrences_counts brut: {len(co_counts)} lignes")
+
+    # Totaux par (app_id, period) pour convertir en pourcentage
+    totals = (co_counts
+              .groupby(["app_id", "period"], as_index=False)["count"]
+              .sum()
+              .rename(columns={"count": "total_pairs"}))
 
     co_pct = co_counts.merge(totals, on=["app_id", "period"], how="left")
     co_pct["percent"] = (co_pct["count"] / co_pct["total_pairs"]).fillna(0.0)
     co_pct = co_pct.drop(columns=["total_pairs"])
+    print(f"[GOLD] cooccurrences_percent brut: {len(co_pct)} lignes")
 
     # Coupe optionnelle
     if TOP_K is not None and len(co_counts) > TOP_K:
@@ -141,25 +119,23 @@ def build_gold(app_ids: Optional[List[str]] = None, for_airflow: bool = False) -
     if TOP_K is not None and len(co_pct) > TOP_K:
         co_pct = co_pct.nlargest(TOP_K, "percent")
 
-    # Ajoute window + ordre colonnes
+    # Ajout de la fenêtre + ordre des colonnes (schéma demandé)
     co_counts["window"] = WINDOW
     co_pct["window"] = WINDOW
 
     co_counts = co_counts[["app_id", "token_a", "token_b", "window", "count", "period"]]
     co_pct    = co_pct   [["app_id", "token_a", "token_b", "window", "percent", "period"]]
 
-    print(f"[GOLD] Écriture Firestore : {len(co_counts)} rows (counts), {len(co_pct)} rows (percent)…")
-
-    # Remplacement complet des collections Firestore avec doc_id LOGIQUE
+    # Publication Firestore (IDs déterministes)
+    print("[GOLD] Publication Firestore…")
     replace_collection(
         "cooccurrences_counts",
         co_counts.to_dict("records"),
-        id_keys=["app_id", "period", "token_a", "token_b"]
+        id_keys=["app_id", "period", "token_a", "token_b", "window"],
     )
     replace_collection(
         "cooccurrences_percent",
         co_pct.to_dict("records"),
-        id_keys=["app_id", "period", "token_a", "token_b"]
+        id_keys=["app_id", "period", "token_a", "token_b", "window"],
     )
-
-    print("[GOLD] Terminé.")
+    print("[GOLD] ✅ Terminé.")
