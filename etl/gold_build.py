@@ -209,8 +209,17 @@ def build_gold(app_ids: Optional[List[str]] = None, for_airflow: bool = False) -
             pct = pct.nlargest(topk, "percent")
 
     # Écritures Firestore (remplacement complet des collections)
-    replace_collection("cooccurrences_counts", counts.to_dict("records"))
-    replace_collection("cooccurrences_percent", pct.to_dict("records"))
+    replace_collection(
+        "cooccurrences_counts",
+        co_counts.to_dict("records"),
+        id_keys=["app_id", "period", "token_a", "token_b"]
+    )
+    
+    replace_collection(
+        "cooccurrences_percent",
+        co_pct.to_dict("records"),
+        id_keys=["app_id", "period", "token_a", "token_b"]
+    )
 
     print(f"[GOLD] Done. window={window} period={period} "
           f"rows_counts={len(counts)} rows_percent={len(pct)}")
