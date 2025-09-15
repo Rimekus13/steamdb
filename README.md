@@ -1,49 +1,54 @@
+# 🎮 Steam Reviews Data Pipeline
 
-# Projet Steam — Starter (Local Mongo + Airflow + Conda)
+## 📌 Description
+Ce projet met en place un **pipeline de données complet** permettant de collecter, transformer, stocker et visualiser les avis Steam.  
+L’objectif est d’automatiser l’ingestion et l’analyse de millions d’avis joueurs afin de produire des **insights exploitables** pour les développeurs et les équipes marketing.
 
-## 1) Conda (optionnel, pour lancer les scripts en dehors d'Airflow)
-```bash
-conda create -n steam_etl python=3.10 -y
-conda activate steam_etl
-pip install -r requirements.txt
-cp .env.example .env  # édite APP_IDS, MONGO_URI
-python -c "import nltk; nltk.download('vader_lexicon'); nltk.download('stopwords')"
-```
+---
 
-## 2) Docker — tout-en-un (Mongo + Airflow)
-```bash
-docker compose up -d
-# Mongo: mongodb://localhost:27017/ (DB: steamdb)
-# UI Mongo Express: http://localhost:8081 (admin/admin)
-# Airflow UI: http://localhost:8080 (admin/admin)
-```
+## 🏗️ Architecture
+- **Collecte** : API Steam → stockage brut JSON dans **Google Cloud Storage (Bronze)**.
+- **Transformation** : nettoyage, NLP (analyse de sentiment, détection de langue), enrichissement → stockage dans **Firestore (Silver/Gold)**.
+- **Orchestration** : **Airflow** (VM GCP) exécute les DAGs de collecte et transformation (batch quotidien).
+- **Visualisation** : **Streamlit** affiche les résultats depuis Firestore, avec message *« Données en cours de chargement »* si pipeline KO.
+- **CI/CD** : **GitHub Actions** → déploiement automatique sur la VM (via `docker compose`).
 
-> Les tâches Airflow lisent /opt/airflow/.env (monté depuis ./.env). Mets-y:
-> MONGO_URI_DOCKER=mongodb://mongo:27017/ pour que les tasks parlent au conteneur Mongo.
+---
 
-## 3) Run manuel sans Airflow (optionnel)
-```bash
-python run_pipeline.py --mode full   # initial
-python run_pipeline.py --mode incr   # mises à jour
-```
+## 📂 Arborescence du projet
 
-## 4) Dashboard (extrait)
-```python
-import os, streamlit as st, pymongo, pandas as pd
-
-@st.cache_resource(show_spinner=False)
-def get_db():
-    uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-    dbname = os.getenv("MONGO_DB", "steamdb")
-    return pymongo.MongoClient(uri)[dbname]
-
-db = get_db()
-avis = pd.DataFrame(list(db['reviews_clean'].find({}, {'_id': 0})))
-co_cnt = pd.DataFrame(list(db['cooccurrences_counts'].find({}, {'_id': 0})))
-co_pct = pd.DataFrame(list(db['cooccurrences_percent'].find({}, {'_id': 0})))
-```
-
-## 5) Collections générées
-- RAW: `reviews_{app_id}`
-- SILVER: `reviews_clean`
-- GOLD: `cooccurrences_counts`, `cooccurrences_percent`
+```plaintext
+steamdb/
+├── dags/                      # DAGs Airflow (collecte, transformation, chargement Firestore)
+│   ├── etl_entrypoint.py      # Entrée principale Airflow
+│   └── example_dag.py         # Exemple DAG (collecte + transformation)
+│
+├── etl/                       # Scripts ETL (modules Python)
+│   ├── __init__.py
+│   ├── bronze_extract.py      # Extraction des avis depuis l’API Steam (Bronze → GCS)
+│   ├── config.py              # Variables de configuration (clés, chemins, app_ids…)
+│   ├── firestore_utils.py     # Fonctions d’insertion et lecture Firestore
+│   ├── gcp_clients.py         # Connexions aux services GCP (GCS, Firestore)
+│   ├── gcs_utils.py           # Gestion du stockage Bronze (GCS)
+│   ├── gold_build.py          # Construction de la couche Gold (agrégats, indicateurs)
+│   ├── http_utils.py          # Fonctions HTTP (requêtes API Steam, pagination, retry)
+│   ├── mongo_utils.py         # Ancien module MongoDB (peut être déprécié si Firestore only)
+│   ├── silver_clean.py        # Nettoyage et enrichissement des avis (Silver)
+│   ├── state.py               # Gestion de l’état (dernier run, checkpoints)
+│   └── text_utils.py          # Fonctions NLP (nettoyage texte, sentiment, langue)
+│
+├── dashboard/                 # Application Streamlit
+│   ├── app.py                 # Dashboard principal
+│   ├── analysis.py            # Fonctions d’analyse et de visualisation
+│   └── requirements.txt       # Dépendances spécifiques au dashboard
+│
+├── logs/                      # Logs persistants (Airflow, ETL)
+│
+├── docker-compose.yml         # Orchestration containers (Airflow + Streamlit)
+├── Dockerfile                 # Image personnalisée si besoin
+├── .env                       # Variables d’environnement (APP_IDS, clés GCP…)
+├── requirements.txt           # Dépendances Python globales
+├── README.md                  # Documentation projet
+└── .github/
+    └── workflows/
+        └── deploy.yml         # Workflow GitHub Actions (CI/CD déploiement VM GCP)
